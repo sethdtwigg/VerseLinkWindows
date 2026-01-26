@@ -1,0 +1,18 @@
+{
+  "bibleVersion": "KJV.xml",
+  "bibleDataPath": "",
+  "hotkeyModifiers": 3,
+  "hotkeyVirtualKey": 76,
+  "enableLogging": true,
+  "enableFileLogging": true,
+  "enableConsoleLogging": true,
+  "logFilePath": "verselink.log",
+  "logLevel": 1,
+  "debugMode": false,
+  "includeReferenceInReplacement": true,
+  "replacementFormat": "{reference} {text}",
+  "showNotifications": false,
+  "notificationDurationMs": 3000,
+  "maxConcurrentTasks": 1,
+  "taskTimeoutMs": 5000
+}

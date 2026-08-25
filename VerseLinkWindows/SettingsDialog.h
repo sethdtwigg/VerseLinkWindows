@@ -10,7 +10,7 @@ class SettingsDialog {
 private:
     HWND hwnd;
     HWND hParent;
-    
+
     // Control IDs
     enum Controls {
         ID_BIBLE_VERSION = 1001,
@@ -21,8 +21,6 @@ private:
         ID_ENABLE_LOGGING = 1006,
         ID_LOG_FILE_PATH = 1007,
         ID_REPLACEMENT_FORMAT = 1008,
-        ID_HOTKEY_MODIFIERS = 1009,
-        ID_HOTKEY_KEY = 1010,
         ID_ICON_PATH = 1011,
         ID_BROWSE_ICON = 1012,
         ID_SAVE = 1013,
@@ -44,6 +42,7 @@ private:
     void SaveSettings();
     void ResetToDefaults();
     void BrowseForIcon();
+    void PopulateBibleVersions(const std::string& currentVersion);
     std::string GetControlText(int controlId);
     void SetControlText(int controlId, const std::string& text);
     bool GetControlChecked(int controlId);
@@ -54,7 +53,7 @@ public:
     SettingsDialog(HWND parentHwnd);
     ~SettingsDialog();
     
-    static INT_PTR CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
+    static LRESULT CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
     bool Show();
     
 private:

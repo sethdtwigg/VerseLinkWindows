@@ -3,12 +3,14 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <filesystem>
 
 // Static member definitions
 std::unique_ptr<Logger> Logger::instance = nullptr;
 std::mutex Logger::instanceMutex;
 
-Logger::Logger() : currentLogLevel(LogLevel::Info), consoleOutput(true), fileOutput(true) {
+Logger::Logger() : currentLogLevel(LogLevel::Info), consoleOutput(true), fileOutput(true),
+                   maxFileSizeBytes(5 * 1024 * 1024), maxBackupFiles(3) {
 }
 
 Logger& Logger::getInstance() {
@@ -19,17 +21,69 @@ Logger& Logger::getInstance() {
     return *instance;
 }
 
-void Logger::initialize(const std::string& logFilePath, LogLevel level, bool console, bool file) {
+void Logger::initialize(const std::string& path, LogLevel level, bool console, bool file,
+                        size_t fileSizeLimit, int backupCount) {
     auto& logger = getInstance();
     logger.currentLogLevel = level;
     logger.consoleOutput = console;
     logger.fileOutput = file;
-    
-    if (file && !logFilePath.empty()) {
-        logger.logFile.open(logFilePath, std::ios::app);
+    logger.logFilePath = path;
+    logger.maxFileSizeBytes = fileSizeLimit;
+    logger.maxBackupFiles = backupCount;
+
+    if (file && !path.empty()) {
+        if (logger.logFile.is_open()) {
+            logger.logFile.close();
+        }
+        logger.logFile.open(path, std::ios::app);
         if (!logger.logFile.is_open()) {
-            std::cerr << "Failed to open log file: " << logFilePath << std::endl;
+            std::cerr << "Failed to open log file: " << path << std::endl;
             logger.fileOutput = false;
+        } else {
+            logger.fileOutput = true;
+        }
+    }
+}
+
+// Rolls the log over once it exceeds maxFileSizeBytes: current -> ".1",
+// ".1" -> ".2", ... keeping at most maxBackupFiles backups. Any failure is
+// non-fatal; logging simply continues into the existing file.
+void Logger::RotateIfNeeded() {
+    if (!logFile.is_open() || maxFileSizeBytes == 0 || logFilePath.empty()) {
+        return;
+    }
+    try {
+        namespace fs = std::filesystem;
+        if (!fs::exists(logFilePath)) {
+            return;
+        }
+        auto size = fs::file_size(logFilePath);
+        if (size < maxFileSizeBytes) {
+            return;
+        }
+
+        logFile.close();
+        const fs::path basePath(logFilePath);
+
+        for (int i = maxBackupFiles - 1; i >= 1; --i) {
+            fs::path from = basePath.string() + "." + std::to_string(i);
+            fs::path to = basePath.string() + "." + std::to_string(i + 1);
+            std::error_code ec;
+            if (fs::exists(from)) {
+                fs::remove(to, ec);
+                fs::rename(from, to, ec);
+            }
+        }
+
+        std::error_code ec;
+        fs::rename(basePath, basePath.string() + ".1", ec);
+        // On failure keep appending to the same file rather than losing logs.
+
+        logFile.open(logFilePath, std::ios::app);
+    } catch (...) {
+        // Never let rotation problems break logging.
+        if (!logFile.is_open() && !logFilePath.empty()) {
+            logFile.open(logFilePath, std::ios::app);
         }
     }
 }
@@ -67,6 +121,8 @@ void Logger::log(LogLevel level, const std::string& message) {
     }
     
     std::lock_guard<std::mutex> lock(logMutex);
+    
+    RotateIfNeeded();
     
     std::string timestamp = getCurrentTimestamp();
     std::string levelStr = levelToString(level);

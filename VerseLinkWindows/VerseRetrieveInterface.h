@@ -8,8 +8,6 @@
 #include "Bible.h"
 #include "tinyxml2.h"
 
-#pragma comment(lib, "urlmon.lib")
-
 using namespace tinyxml2;
 
 class VerseRetrieveInterface
@@ -21,16 +19,11 @@ class VerseRetrieveInterface
     bool parseBibleReference();
     bool parseSingleReference(const std::string& refStr);
     std::vector<std::string> splitMultipleReferences(const std::string& input);
-    XMLElement* ParseXMLBible(XMLElement* node, const std::string& targetAttributeValue);
+    const XMLElement* ParseXMLBible(const XMLElement* node, const std::string& targetAttributeValue);
     std::string prepareResult(const std::string& result);
-    std::string addVerseNumbers(const std::string& text);
-    std::string addNewLinesBetweenChapters(const std::string& text);
-    std::string AddNewLinesBetweenBooks(const std::string& text);
-    std::string cleanXmlMarkers(const std::string& text);
 
-    std::string getVersesFromChapter(XMLElement* chapterNode, const std::string& startVerse, const std::string& endVerse);
-    std::string getMultipleVerses(XMLElement* chapterNode, const std::string& versesList);
-    std::string getChaptersFromBook(XMLElement* bookNode, const std::string& startChapter, const std::string& endChapter);
+    std::string getVersesFromChapter(const XMLElement* chapterNode, const std::string& startVerse, const std::string& endVerse);
+    std::string getMultipleVerses(const XMLElement* chapterNode, const std::string& versesList);
     void LogMessage(const std::string& message);
 
 public:	
@@ -39,6 +32,7 @@ public:
     std::string ReferenceText;
     std::string VerseText;
     std::string GetLog() const { return Log; }
+    const std::vector<Bible::BibleReference>& ParsedReferences() const { return references; }
     VerseRetrieveInterface(const std::string& selectedText, const std::string& version);
     bool GetVerseText();
     ~VerseRetrieveInterface();

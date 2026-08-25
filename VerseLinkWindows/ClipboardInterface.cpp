@@ -1,18 +1,116 @@
 #include "ClipboardInterface.h"
 #include "ConfigManager.h"
+#include "Logger.h"
 #include <comdef.h>
 #include <vector>
 #include <algorithm>
 
-// RAII wrapper for COM initialization
+// Per-thread RAII wrapper for COM initialization. CoInitialize must be called
+// on every thread that uses COM (UI Automation), and a successful call -
+// including S_FALSE - must be balanced by CoUninitialize. A previous
+// function-local static only initialized the first worker thread's apartment.
 struct COMInitializer {
-    COMInitializer() { CoInitialize(NULL); }
-    ~COMInitializer() { CoUninitialize(); }
+    bool initialized = false;
+    COMInitializer() {
+        HRESULT hr = CoInitialize(NULL);
+        // S_OK and S_FALSE both require a balancing CoUninitialize.
+        initialized = SUCCEEDED(hr);
+    }
+    ~COMInitializer() {
+        if (initialized) {
+            CoUninitialize();
+        }
+    }
 };
+
+namespace {
+    void RestoreClipboardText(const std::string& utf8Text) {
+        if (!ConfigManager::getInstance().useExistingClipboard()) {
+            return; // user opted out of touching clipboard state on failure paths
+        }
+        if (!OpenClipboard(NULL)) {
+            LOG_ERROR("Failed to open clipboard while restoring previous content");
+            return;
+        }
+        EmptyClipboard();
+        bool ok = false;
+        std::wstring wide = StringExtensions::Utf8ToWide(utf8Text);
+        HGLOBAL hGlobal = GlobalAlloc(GMEM_MOVEABLE, (wide.size() + 1) * sizeof(wchar_t));
+        if (hGlobal) {
+            if (wchar_t* psz = static_cast<wchar_t*>(GlobalLock(hGlobal))) {
+                wcscpy_s(psz, wide.size() + 1, wide.c_str());
+                GlobalUnlock(hGlobal);
+                if (SetClipboardData(CF_UNICODETEXT, hGlobal) != NULL) {
+                    ok = true;
+                }
+            }
+            if (!ok) {
+                GlobalFree(hGlobal);
+            }
+        }
+        CloseClipboard();
+        if (!ok) {
+            LOG_ERROR("Failed to restore previous clipboard content");
+        }
+    }
+
+    std::string ReadClipboardTextUtf8() {
+        if (!OpenClipboard(NULL)) return std::string();
+        std::string result;
+        if (HANDLE hData = GetClipboardData(CF_UNICODETEXT)) {
+            if (wchar_t* psz = static_cast<wchar_t*>(GlobalLock(hData))) {
+                result = StringExtensions::WideToUtf8(psz, static_cast<int>(wcslen(psz)));
+                GlobalUnlock(hData);
+            }
+        } else if (HANDLE hData = GetClipboardData(CF_TEXT)) {
+            if (char* psz = static_cast<char*>(GlobalLock(hData))) {
+                result = StringExtensions::AnsiToUtf8(psz);
+                GlobalUnlock(hData);
+            }
+        }
+        CloseClipboard();
+        return result;
+    }
+
+    bool WriteClipboardText(const std::string& utf8Text) {
+        // Windows editors expect CRLF line endings; internal text uses bare LF.
+        std::string normalized;
+        normalized.reserve(utf8Text.size() + 8);
+        for (size_t i = 0; i < utf8Text.size(); ++i) {
+            char c = utf8Text[i];
+            if (c == '\n' && (i == 0 || utf8Text[i - 1] != '\r')) {
+                normalized += "\r\n";
+            } else {
+                normalized += c;
+            }
+        }
+
+        if (!OpenClipboard(NULL)) return false;
+        EmptyClipboard();
+        bool ok = false;
+        std::wstring wide = StringExtensions::Utf8ToWide(normalized);
+        HGLOBAL hGlobal = GlobalAlloc(GMEM_MOVEABLE, (wide.size() + 1) * sizeof(wchar_t));
+        if (hGlobal) {
+            if (wchar_t* psz = static_cast<wchar_t*>(GlobalLock(hGlobal))) {
+                wcscpy_s(psz, wide.size() + 1, wide.c_str());
+                GlobalUnlock(hGlobal);
+                // On success ownership transfers to the system; do not free.
+                if (SetClipboardData(CF_UNICODETEXT, hGlobal) != NULL) {
+                    ok = true;
+                }
+            }
+            if (!ok) {
+                GlobalFree(hGlobal);
+            }
+        }
+        CloseClipboard();
+        return ok;
+    }
+}
 
 ClipboardInterface::ClipboardInterface()
 {
-    static COMInitializer comInit;
+    m_com.reset(new COMInitializer());
     Log = "";
     m_target_window = GetForegroundWindow();
     
@@ -56,8 +154,9 @@ std::string ClipboardInterface::GetSelectedTextUsingUIAutomation() {
         BSTR elementName = NULL;
         pElement->get_CurrentName(&elementName);
         if (elementName) {
-            _bstr_t name(elementName, false);
-            Log += "UI Automation: Focused element name: " + std::string(name) + "\n";
+            Log += "UI Automation: Focused element name: " +
+                   StringExtensions::WideToUtf8(elementName, static_cast<int>(SysStringLen(elementName))) + "\n";
+            SysFreeString(elementName);
         }
         
         // Get text pattern
@@ -85,12 +184,12 @@ std::string ClipboardInterface::GetSelectedTextUsingUIAutomation() {
                         hr = pTextRange->GetText(-1, &bstrText);
                         
                         if (SUCCEEDED(hr) && bstrText) {
-                            _bstr_t text(bstrText, false);
-                            result = (const char*)text;
+                            result = StringExtensions::WideToUtf8(bstrText, static_cast<int>(SysStringLen(bstrText)));
                             if (!result.empty()) {
                                 Log += "UI Automation: Successfully retrieved text: '" + result + "'\n";
                             }
                         }
+                        if (bstrText) SysFreeString(bstrText);
                         
                         pTextRange->Release();
                     }
@@ -135,12 +234,12 @@ std::string ClipboardInterface::GetSelectedTextUsingUIAutomation() {
                                 hr = pSelectedRange->GetText(-1, &bstrText);
                                 
                                 if (SUCCEEDED(hr) && bstrText) {
-                                    _bstr_t text(bstrText, false);
-                                    result = (const char*)text;
+                                    result = StringExtensions::WideToUtf8(bstrText, static_cast<int>(SysStringLen(bstrText)));
                                     if (!result.empty()) {
                                         Log += "UI Automation: Successfully retrieved text from document range: '" + result + "'\n";
                                     }
                                 }
+                                if (bstrText) SysFreeString(bstrText);
                                 
                                 pSelectedRange->Release();
                             }
@@ -254,8 +353,6 @@ bool ClipboardInterface::SendKeys(const std::vector<WORD>& keys) {
 }
 
 std::string ClipboardInterface::GetSelectedTextUsingClipboard() {
-    auto& config = ConfigManager::getInstance();
-    
     // Get current foreground window to ensure we're targeting the right application
     HWND currentWindow = GetForegroundWindow();
     if (!currentWindow) {
@@ -269,80 +366,17 @@ std::string ClipboardInterface::GetSelectedTextUsingClipboard() {
     SetForegroundWindow(currentWindow);
     Sleep(100); // Small delay to ensure focus is established
     
-    // For debugging purposes, always force copy to test the functionality
-    // In production, this would check if we should use existing clipboard content first
-    bool forceCopy = true; // Always force copy for testing
-    Log += "Clipboard: Force copy mode enabled for testing\n";
-    
-    if (!forceCopy && config.useExistingClipboard()) {
-        // First, check if there's already text on clipboard that might be the selection
-        if (OpenClipboard(NULL)) {
-            HANDLE hData = GetClipboardData(CF_TEXT);
-            std::string existingClipboard;
-            if (hData) {
-                char* pszText = static_cast<char*>(GlobalLock(hData));
-                if (pszText) {
-                    existingClipboard = pszText;
-                    GlobalUnlock(hData);
-                }
-            }
-            CloseClipboard();
-            
-            // If there's already text on clipboard, check if it looks like a valid Bible reference
-            // This avoids unnecessary Ctrl+C operations for valid references
-            if (!existingClipboard.empty()) {
-                // More comprehensive check for Bible reference pattern
-                bool looksLikeValidReference = false;
-                
-                // Check for common Bible reference patterns
-                // Pattern 1: Book Chapter:Verse (e.g., "John 3:16", "Genesis 1:1-3")
-                bool hasColon = existingClipboard.find(':') != std::string::npos;
-                // Pattern 2: Book Chapter (e.g., "John 3", "Genesis 1")
-                bool hasSpaceAndNumber = false;
-                size_t spacePos = existingClipboard.find(' ');
-                if (spacePos != std::string::npos && spacePos < existingClipboard.length() - 1) {
-                    hasSpaceAndNumber = isdigit(existingClipboard[spacePos + 1]);
-                }
-                // Pattern 3: Just a number (too simple, likely not a reference)
-                bool justNumber = true;
-                for (char c : existingClipboard) {
-                    if (!isdigit(c) && c != ' ' && c != '\t' && c != '\n' && c != '\r') {
-                        justNumber = false;
-                        break;
-                    }
-                }
-                
-                looksLikeValidReference = (hasColon || hasSpaceAndNumber) && !justNumber;
-                
-                if (looksLikeValidReference) {
-                    Log += "Clipboard: Using existing clipboard content (valid reference pattern)\n";
-                    return existingClipboard;
-                } else {
-                    Log += "Clipboard: Existing content doesn't look like valid reference, forcing copy\n";
-                }
-            }
-        }
-    } else {
-        Log += "Clipboard: Force copy enabled, always copying selection\n";
-    }
-    
-    // Always send Ctrl+C to get the actual selection
-    Log += "Clipboard: Sending Ctrl+C to copy selection\n";
-    
-    // Save current clipboard content
+    // Save current clipboard content (Unicode preserving)
     std::string oldClipboard;
-    if (OpenClipboard(NULL)) {
-        HANDLE hOldData = GetClipboardData(CF_TEXT);
-        if (hOldData) {
-            char* pszOldText = static_cast<char*>(GlobalLock(hOldData));
-            if (pszOldText) {
-                oldClipboard = pszOldText;
-                Log += "Clipboard: Saved old clipboard: '" + oldClipboard + "'\n";
-                GlobalUnlock(hOldData);
-            }
-        }
-        CloseClipboard();
+    oldClipboard = ReadClipboardTextUtf8();
+    if (!oldClipboard.empty()) {
+        Log += "Clipboard: Saved previous clipboard content\n";
     }
+    
+    // Always send Ctrl+C: copying is the only reliable way to capture the
+    // live selection (previously a test-only forceCopy flag skipped this and
+    // made the result depend on stale clipboard content).
+    Log += "Clipboard: Sending Ctrl+C to copy selection\n";
     
     // Send Ctrl+C to copy selected text
     std::vector<WORD> keys = {VK_CONTROL, 'C'};
@@ -351,48 +385,20 @@ std::string ClipboardInterface::GetSelectedTextUsingClipboard() {
         return "";
     }
     
-    Sleep(300); // Increased wait for copy operation in modern applications
+    Sleep(300); // Wait for copy operation in modern applications
     
     // Get new clipboard content
-    if (!OpenClipboard(NULL)) {
-        LogError("Failed to open clipboard after copy");
-        return "";
+    std::string selectedText = ReadClipboardTextUtf8();
+    if (!selectedText.empty()) {
+        Log += "Clipboard: Retrieved selection (" + std::to_string(selectedText.length()) + " chars)\n";
+    } else {
+        LogError("Clipboard: No text found after copy operation");
     }
-    
-    HANDLE hNewData = GetClipboardData(CF_TEXT);
-    std::string selectedText;
-    if (hNewData) {
-        char* pszNewText = static_cast<char*>(GlobalLock(hNewData));
-        if (pszNewText) {
-            selectedText = pszNewText;
-            Log += "Clipboard: Retrieved new content: '" + selectedText + "'\n";
-            GlobalUnlock(pszNewText);
-        }
-    }
-    CloseClipboard();
     
     // Restore original clipboard if no new content
     if (selectedText.empty() && !oldClipboard.empty()) {
         Log += "Clipboard: No new content, restoring original clipboard\n";
-        if (OpenClipboard(NULL)) {
-            EmptyClipboard();
-            HGLOBAL hData = GlobalAlloc(GMEM_MOVEABLE, oldClipboard.size() + 1);
-            if (hData) {
-                char* pszText = static_cast<char*>(GlobalLock(hData));
-                if (pszText) {
-                    strcpy_s(pszText, oldClipboard.size() + 1, oldClipboard.c_str());
-                    GlobalUnlock(hData);
-                    SetClipboardData(CF_TEXT, hData);
-                }
-            }
-            CloseClipboard();
-        }
-    }
-    
-    if (!selectedText.empty()) {
-        Log += "Clipboard: Successfully retrieved selected text\n";
-    } else {
-        LogError("Clipboard: No text found after copy operation");
+        RestoreClipboardText(oldClipboard);
     }
     
     return selectedText;
@@ -458,77 +464,26 @@ bool ClipboardInterface::ReplaceSelectedText(const std::string& newText) {
         }
     }
     
-    // Save current clipboard
+    // Save current clipboard (Unicode preserving)
     Log += "ReplaceSelectedText: Saving current clipboard\n";
-    if (!OpenClipboard(NULL)) {
-        LogError("Failed to open clipboard for replacement");
-        return false;
+    std::string oldClipboard = ReadClipboardTextUtf8();
+    if (!oldClipboard.empty()) {
+        Log += "ReplaceSelectedText: Saved previous clipboard content\n";
     }
-    
-    HANDLE hOldData = GetClipboardData(CF_TEXT);
-    std::string oldClipboard;
-    if (hOldData) {
-        char* pszOldText = static_cast<char*>(GlobalLock(hOldData));
-        if (pszOldText) {
-            oldClipboard = pszOldText;
-            Log += "ReplaceSelectedText: Saved old clipboard: '" + oldClipboard + "'\n";
-            GlobalUnlock(hOldData);
-        }
-    }
-    CloseClipboard();
     
     // Put new text on clipboard
     Log += "ReplaceSelectedText: Setting new text on clipboard\n";
-    if (!OpenClipboard(NULL)) {
-        LogError("Failed to open clipboard to set new text");
+    if (!WriteClipboardText(newText)) {
+        // Never send Ctrl+V with a clipboard we did not successfully fill:
+        // that would paste nothing and simply delete the user's selection.
+        LogError("Failed to set replacement text on clipboard; aborting before paste");
+        if (!oldClipboard.empty()) {
+            RestoreClipboardText(oldClipboard);
+        }
         return false;
     }
     
-    EmptyClipboard();
-    
-    // Try Unicode text first (better for modern applications)
-    std::wstring wNewText(newText.begin(), newText.end());
-    HGLOBAL hUnicodeData = GlobalAlloc(GMEM_MOVEABLE, (wNewText.size() + 1) * sizeof(wchar_t));
-    if (hUnicodeData) {
-        wchar_t* pszUnicodeText = static_cast<wchar_t*>(GlobalLock(hUnicodeData));
-        if (pszUnicodeText) {
-            wcscpy_s(pszUnicodeText, wNewText.size() + 1, wNewText.c_str());
-            GlobalUnlock(hUnicodeData);
-            SetClipboardData(CF_UNICODETEXT, hUnicodeData);
-            Log += "ReplaceSelectedText: Set Unicode text on clipboard\n";
-        }
-    }
-    
-    // Also set ANSI text as fallback
-    HGLOBAL hData = GlobalAlloc(GMEM_MOVEABLE, newText.size() + 1);
-    if (hData) {
-        char* pszText = static_cast<char*>(GlobalLock(hData));
-        if (pszText) {
-            strcpy_s(pszText, newText.size() + 1, newText.c_str());
-            GlobalUnlock(hData);
-            SetClipboardData(CF_TEXT, hData);
-            Log += "ReplaceSelectedText: Set ANSI text on clipboard\n";
-        }
-    }
-    
-    CloseClipboard();
-    
     Log += "ReplaceSelectedText: New text placed on clipboard\n";
-    
-    // Verify clipboard content
-    Sleep(50);
-    if (OpenClipboard(NULL)) {
-        HANDLE hVerifyData = GetClipboardData(CF_TEXT);
-        if (hVerifyData) {
-            char* pszVerifyText = static_cast<char*>(GlobalLock(hVerifyData));
-            if (pszVerifyText) {
-                std::string verifyText = pszVerifyText;
-                Log += "ReplaceSelectedText: Verified clipboard content: '" + verifyText + "'\n";
-                GlobalUnlock(hVerifyData);
-            }
-        }
-        CloseClipboard();
-    }
     
     // Ensure the target window is still focused before sending paste
     Sleep(50);
@@ -619,53 +574,17 @@ bool ClipboardInterface::ReplaceSelectedText(const std::string& newText) {
         success = true;
     }
     
-    // Restore original clipboard after a longer delay to ensure paste completes
+    // Give the paste time to complete before restoring the original clipboard.
     Log += "ReplaceSelectedText: Waiting for paste to complete\n";
-    Sleep(2000); // Increased delay for modern applications
-    
-    // Verify the paste actually happened by checking if clipboard still has our text
-    bool pasteSuccessful = false;
-    if (OpenClipboard(NULL)) {
-        HANDLE hVerifyData = GetClipboardData(CF_TEXT);
-        if (hVerifyData) {
-            char* pszVerifyText = static_cast<char*>(GlobalLock(hVerifyData));
-            if (pszVerifyText) {
-                std::string verifyText = pszVerifyText;
-                // If clipboard still has our text, paste likely didn't happen yet
-                if (verifyText == newText) {
-                    Log += "ReplaceSelectedText: Clipboard still has new text, paste may not have completed\n";
-                    // Wait longer and check again
-                    Sleep(2000);
-                    pasteSuccessful = true;
-                } else {
-                    Log += "ReplaceSelectedText: Clipboard content changed, paste likely successful\n";
-                    pasteSuccessful = true;
-                }
-                GlobalUnlock(hVerifyData);
-            }
-        }
-        CloseClipboard();
-    }
+    Sleep(1500);
     
     if (!oldClipboard.empty()) {
         Log += "ReplaceSelectedText: Restoring original clipboard\n";
-        if (OpenClipboard(NULL)) {
-            EmptyClipboard();
-            HGLOBAL hOldData = GlobalAlloc(GMEM_MOVEABLE, oldClipboard.size() + 1);
-            if (hOldData) {
-                char* pszOldText = static_cast<char*>(GlobalLock(hOldData));
-                if (pszOldText) {
-                    strcpy_s(pszOldText, oldClipboard.size() + 1, oldClipboard.c_str());
-                    GlobalUnlock(hOldData);
-                    SetClipboardData(CF_TEXT, hOldData);
-                }
-            }
-            CloseClipboard();
-        }
+        RestoreClipboardText(oldClipboard);
     }
     
-    if (!pasteSuccessful) {
-        Log += "ReplaceSelectedText: Warning - paste may not have completed successfully\n";
+    if (!success) {
+        Log += "ReplaceSelectedText: Paste keys could not be delivered\n";
     }
     
     Log += "ReplaceSelectedText: Replacement process completed\n";

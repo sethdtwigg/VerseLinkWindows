@@ -3,6 +3,7 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
 
 // Static member definitions
@@ -37,6 +38,76 @@ std::string ConfigManager::expandPath(const std::string& path) {
     return path;
 }
 
+namespace {
+    // Returns the position of the first character of a key's JSON value,
+    // i.e. just past the ':' following "<key>". npos if the key is absent/malformed.
+    size_t FindValueStart(const std::string& json, const std::string& key) {
+        std::string token = "\"" + key + "\"";
+        size_t pos = json.find(token);
+        if (pos == std::string::npos) return std::string::npos;
+        pos = json.find(':', pos + token.size());
+        if (pos == std::string::npos) return std::string::npos;
+        ++pos;
+        while (pos < json.size() && isspace(static_cast<unsigned char>(json[pos]))) ++pos;
+        return pos < json.size() ? pos : std::string::npos;
+    }
+
+    bool ExtractString(const std::string& json, const std::string& key, std::string& out) {
+        size_t start = FindValueStart(json, key);
+        if (start == std::string::npos || json[start] != '"') return false;
+        std::string result;
+        for (size_t i = start + 1; i < json.size(); ++i) {
+            char c = json[i];
+            if (c == '\\' && i + 1 < json.size()) {
+                char next = json[++i];
+                switch (next) {
+                    case '"':  result += '"';  break;
+                    case '\\': result += '\\'; break;
+                    case '/':  result += '/';  break;
+                    case 'n':  result += '\n'; break;
+                    case 't':  result += '\t'; break;
+                    case 'r':  result += '\r'; break;
+                    case 'b':  result += '\b'; break;
+                    case 'f':  result += '\f'; break;
+                    default:   result += next; break;
+                }
+            } else if (c == '"') {
+                out = result;
+                return true;
+            } else {
+                result += c;
+            }
+        }
+        return false; // unterminated string
+    }
+
+    bool ExtractBool(const std::string& json, const std::string& key, bool& out) {
+        size_t start = FindValueStart(json, key);
+        if (start == std::string::npos) return false;
+        if (json.compare(start, 4, "true") == 0) { out = true; return true; }
+        if (json.compare(start, 5, "false") == 0) { out = false; return true; }
+        return false;
+    }
+
+    bool ExtractInt(const std::string& json, const std::string& key, int& out) {
+        size_t start = FindValueStart(json, key);
+        if (start == std::string::npos) return false;
+        try {
+            size_t consumed = 0;
+            int value = std::stoi(json.substr(start), &consumed);
+            // Accept only if something numeric was actually consumed
+            if (consumed == 0 ||
+                (json[start] != '-' && json[start] != '+' && !isdigit(static_cast<unsigned char>(json[start])))) {
+                return false;
+            }
+            out = value;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+}
+
 bool ConfigManager::load() {
     if (configFilePath.empty()) {
         LOG_WARNING("No config file path specified, using defaults");
@@ -55,166 +126,52 @@ bool ConfigManager::load() {
         buffer << file.rdbuf();
         std::string content = buffer.str();
         file.close();
-        
-        // Simple JSON-like parsing (basic implementation)
-        // In a production system, you'd use a proper JSON library
-        
-        // Parse bible version
-        size_t pos = content.find("\"bibleVersion\"");
-        if (pos != std::string::npos) {
-            size_t start = content.find("\"", pos + 15) + 1;
-            size_t end = content.find("\"", start);
-            if (end != std::string::npos) {
-                config.bibleVersion = content.substr(start, end - start);
-            }
-        }
-        
-        // Parse debug mode
-        pos = content.find("\"debugMode\"");
-        if (pos != std::string::npos) {
-            size_t start = content.find(":", pos) + 1;
-            size_t end = content.find(",", start);
-            if (end == std::string::npos) end = content.find("}", start);
-            if (end != std::string::npos) {
-                std::string value = content.substr(start, end - start);
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                config.debugMode = (value.find("true") != std::string::npos);
-            }
-        }
-        
-        // Parse logging enabled
-        pos = content.find("\"enableLogging\"");
-        if (pos != std::string::npos) {
-            size_t start = content.find(":", pos) + 1;
-            size_t end = content.find(",", start);
-            if (end == std::string::npos) end = content.find("}", start);
-            if (end != std::string::npos) {
-                std::string value = content.substr(start, end - start);
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                config.enableLogging = (value.find("true") != std::string::npos);
-            }
-        }
-        
-        // Parse include reference
-        pos = content.find("\"includeReferenceInReplacement\"");
-        if (pos != std::string::npos) {
-            size_t start = content.find(":", pos) + 1;
-            size_t end = content.find(",", start);
-            if (end == std::string::npos) end = content.find("}", start);
-            if (end != std::string::npos) {
-                std::string value = content.substr(start, end - start);
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                config.includeReferenceInReplacement = (value.find("true") != std::string::npos);
-            }
-        }
-        
-        // Parse replacement format
-        pos = content.find("\"replacementFormat\"");
-        if (pos != std::string::npos) {
-            size_t start = content.find("\"", pos + 20) + 1;
-            size_t end = content.find("\"", start);
-            if (end != std::string::npos) {
-                config.replacementFormat = content.substr(start, end - start);
-            }
-        }
-        
-        // Parse prefer direct selection
-        pos = content.find("\"preferDirectSelection\"");
-        if (pos != std::string::npos) {
-            size_t start = content.find(":", pos) + 1;
-            size_t end = content.find(",", start);
-            if (end == std::string::npos) end = content.find("}", start);
-            if (end != std::string::npos) {
-                std::string value = content.substr(start, end - start);
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                config.preferDirectSelection = (value.find("true") != std::string::npos);
-            }
-        }
-        
-        // Parse use existing clipboard
-        pos = content.find("\"useExistingClipboard\"");
-        if (pos != std::string::npos) {
-            size_t start = content.find(":", pos) + 1;
-            size_t end = content.find(",", start);
-            if (end == std::string::npos) end = content.find("}", start);
-            if (end != std::string::npos) {
-                std::string value = content.substr(start, end - start);
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                config.useExistingClipboard = (value.find("true") != std::string::npos);
-            }
-        }
-        
-        // Parse icon path
-        pos = content.find("\"iconPath\"");
-        if (pos != std::string::npos) {
-            size_t start = content.find("\"", pos + 11) + 1;
-            size_t end = content.find("\"", start);
-            if (end != std::string::npos) {
-                config.iconPath = content.substr(start, end - start);
-            }
-        }
-        
-        // Parse verse formatting options
-        pos = content.find("\"includeVerseNumbers\"");
-        if (pos != std::string::npos) {
-            size_t start = content.find(":", pos) + 1;
-            size_t end = content.find(",", start);
-            if (end == std::string::npos) end = content.find("}", start);
-            if (end != std::string::npos) {
-                std::string value = content.substr(start, end - start);
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                config.includeVerseNumbers = (value.find("true") != std::string::npos);
-            }
-        }
-        
-        pos = content.find("\"newLineBetweenChapters\"");
-        if (pos != std::string::npos) {
-            size_t start = content.find(":", pos) + 1;
-            size_t end = content.find(",", start);
-            if (end == std::string::npos) end = content.find("}", start);
-            if (end != std::string::npos) {
-                std::string value = content.substr(start, end - start);
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                config.newLineBetweenChapters = (value.find("true") != std::string::npos);
-            }
-        }
-        
-        pos = content.find("\"newLineBetweenBooks\"");
-        if (pos != std::string::npos) {
-            size_t start = content.find(":", pos) + 1;
-            size_t end = content.find(",", start);
-            if (end == std::string::npos) end = content.find("}", start);
-            if (end != std::string::npos) {
-                std::string value = content.substr(start, end - start);
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                config.newLineBetweenBooks = (value.find("true") != std::string::npos);
-            }
-        }
-        
-        pos = content.find("\"referenceOnFirstLine\"");
-        if (pos != std::string::npos) {
-            size_t start = content.find(":", pos) + 1;
-            size_t end = content.find(",", start);
-            if (end == std::string::npos) end = content.find("}", start);
-            if (end != std::string::npos) {
-                std::string value = content.substr(start, end - start);
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                config.referenceOnFirstLine = (value.find("true") != std::string::npos);
-            }
+
+        // Apply parsed values atomically with respect to other threads
+        {
+            std::lock_guard<std::mutex> lock(configMutex);
+
+        // Bible settings
+        ExtractString(content, "bibleVersion", config.bibleVersion);
+        ExtractString(content, "bibleDataPath", config.bibleDataPath);
+
+        // Hotkey settings
+        ExtractInt(content, "hotkeyModifiers", config.hotkeyModifiers);
+        ExtractInt(content, "hotkeyVirtualKey", config.hotkeyVirtualKey);
+
+        // Logging settings
+        ExtractBool(content, "enableLogging", config.enableLogging);
+        ExtractBool(content, "enableFileLogging", config.enableFileLogging);
+        ExtractBool(content, "enableConsoleLogging", config.enableConsoleLogging);
+        ExtractString(content, "logFilePath", config.logFilePath);
+        ExtractInt(content, "logLevel", config.logLevel);
+
+        // Application settings
+        ExtractBool(content, "debugMode", config.debugMode);
+        ExtractBool(content, "includeReferenceInReplacement", config.includeReferenceInReplacement);
+        ExtractString(content, "replacementFormat", config.replacementFormat);
+
+        // Text selection settings
+        ExtractBool(content, "preferDirectSelection", config.preferDirectSelection);
+        ExtractBool(content, "useExistingClipboard", config.useExistingClipboard);
+
+        // UI / icon settings
+        ExtractString(content, "iconPath", config.iconPath);
+        ExtractBool(content, "showNotifications", config.showNotifications);
+        ExtractInt(content, "notificationDurationMs", config.notificationDurationMs);
+
+        // Performance settings
+        ExtractInt(content, "maxConcurrentTasks", config.maxConcurrentTasks);
+        ExtractInt(content, "taskTimeoutMs", config.taskTimeoutMs);
+
+        // Verse formatting options
+        ExtractBool(content, "includeVerseNumbers", config.includeVerseNumbers);
+        ExtractBool(content, "newLineBetweenChapters", config.newLineBetweenChapters);
+        ExtractBool(content, "newLineBetweenBooks", config.newLineBetweenBooks);
+        ExtractBool(content, "referenceOnFirstLine", config.referenceOnFirstLine);
+        ExtractBool(content, "dynamicReference", config.dynamicReference);
         }
 
-        pos = content.find("\"dynamicReference\"");
-        if (pos != std::string::npos) {
-            size_t start = content.find(":", pos) + 1;
-            size_t end = content.find(",", start);
-            if (end == std::string::npos) end = content.find("}", start);
-            if (end != std::string::npos) {
-                std::string value = content.substr(start, end - start);
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                config.dynamicReference = (value.find("true") != std::string::npos);
-            }
-        }
-        
         LOG_INFO("Configuration loaded successfully from: " + configFilePath);
         return true;
     }
@@ -231,6 +188,14 @@ bool ConfigManager::save() {
     }
     
     try {
+        // Snapshot the config under lock, then write without holding it
+        VerseLinkConfig snapshot;
+        {
+            std::lock_guard<std::mutex> lock(configMutex);
+            snapshot = config;
+        }
+        const VerseLinkConfig& config = snapshot;
+
         std::ofstream file(configFilePath);
         if (!file.is_open()) {
             LOG_ERROR("Failed to open config file for writing: " + configFilePath);
@@ -297,88 +262,177 @@ bool ConfigManager::save() {
     }
 }
 
-// Getters implementation already in header
+// Thread-safe getters
+VerseLinkConfig ConfigManager::getConfig() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config;
+}
 
-// Setters
+std::string ConfigManager::getBibleVersion() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.bibleVersion;
+}
+
+std::string ConfigManager::getBibleDataPath() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.bibleDataPath;
+}
+
+int ConfigManager::getHotkeyModifiers() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.hotkeyModifiers;
+}
+
+int ConfigManager::getHotkeyVirtualKey() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.hotkeyVirtualKey;
+}
+
+bool ConfigManager::isLoggingEnabled() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.enableLogging;
+}
+
+bool ConfigManager::isDebugMode() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.debugMode;
+}
+
+bool ConfigManager::includeReferenceInReplacement() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.includeReferenceInReplacement;
+}
+
+std::string ConfigManager::getReplacementFormat() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.replacementFormat;
+}
+
+std::string ConfigManager::getLogFilePath() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.logFilePath;
+}
+
+std::string ConfigManager::getIconPath() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.iconPath;
+}
+
+bool ConfigManager::preferDirectSelection() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.preferDirectSelection;
+}
+
+bool ConfigManager::useExistingClipboard() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.useExistingClipboard;
+}
+
+bool ConfigManager::includeVerseNumbers() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.includeVerseNumbers;
+}
+
+bool ConfigManager::newLineBetweenChapters() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.newLineBetweenChapters;
+}
+
+bool ConfigManager::newLineBetweenBooks() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.newLineBetweenBooks;
+}
+
+bool ConfigManager::referenceOnFirstLine() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.referenceOnFirstLine;
+}
+
+bool ConfigManager::dynamicReference() const {
+    std::lock_guard<std::mutex> lock(configMutex);
+    return config.dynamicReference;
+}
+
+// Setters - mutate under lock, then notify with the lock released so the
+// callback may safely call getters.
 void ConfigManager::setBibleVersion(const std::string& version) {
-    config.bibleVersion = version;
+    { std::lock_guard<std::mutex> lock(configMutex); config.bibleVersion = version; }
     notifySettingsChanged();
 }
 
 void ConfigManager::setBibleDataPath(const std::string& path) {
-    config.bibleDataPath = path;
+    { std::lock_guard<std::mutex> lock(configMutex); config.bibleDataPath = path; }
     notifySettingsChanged();
 }
 
 void ConfigManager::setHotkey(int modifiers, int virtualKey) {
-    config.hotkeyModifiers = modifiers;
-    config.hotkeyVirtualKey = virtualKey;
+    { std::lock_guard<std::mutex> lock(configMutex); config.hotkeyModifiers = modifiers; config.hotkeyVirtualKey = virtualKey; }
     notifySettingsChanged();
 }
 
 void ConfigManager::setLoggingEnabled(bool enabled) {
-    config.enableLogging = enabled;
+    { std::lock_guard<std::mutex> lock(configMutex); config.enableLogging = enabled; }
     notifySettingsChanged();
 }
 
 void ConfigManager::setDebugMode(bool enabled) {
-    config.debugMode = enabled;
+    { std::lock_guard<std::mutex> lock(configMutex); config.debugMode = enabled; }
     notifySettingsChanged();
 }
 
 void ConfigManager::setIncludeReferenceInReplacement(bool include) {
-    config.includeReferenceInReplacement = include;
+    { std::lock_guard<std::mutex> lock(configMutex); config.includeReferenceInReplacement = include; }
     notifySettingsChanged();
 }
 
 void ConfigManager::setReplacementFormat(const std::string& format) {
-    config.replacementFormat = format;
+    { std::lock_guard<std::mutex> lock(configMutex); config.replacementFormat = format; }
     notifySettingsChanged();
 }
 
 void ConfigManager::setPreferDirectSelection(bool prefer) {
-    config.preferDirectSelection = prefer;
+    { std::lock_guard<std::mutex> lock(configMutex); config.preferDirectSelection = prefer; }
     notifySettingsChanged();
 }
 
 void ConfigManager::setUseExistingClipboard(bool use) {
-    config.useExistingClipboard = use;
+    { std::lock_guard<std::mutex> lock(configMutex); config.useExistingClipboard = use; }
     notifySettingsChanged();
 }
 
 void ConfigManager::setIconPath(const std::string& iconPath) {
-    config.iconPath = iconPath;
+    { std::lock_guard<std::mutex> lock(configMutex); config.iconPath = iconPath; }
     notifySettingsChanged();
 }
 
 void ConfigManager::setLogFilePath(const std::string& logFilePath) {
-    config.logFilePath = logFilePath;
+    { std::lock_guard<std::mutex> lock(configMutex); config.logFilePath = logFilePath; }
     notifySettingsChanged();
 }
 
 // Verse formatting setters
 void ConfigManager::setIncludeVerseNumbers(bool include) {
-    config.includeVerseNumbers = include;
+    { std::lock_guard<std::mutex> lock(configMutex); config.includeVerseNumbers = include; }
     notifySettingsChanged();
 }
 
 void ConfigManager::setNewLineBetweenChapters(bool newLine) {
-    config.newLineBetweenChapters = newLine;
+    { std::lock_guard<std::mutex> lock(configMutex); config.newLineBetweenChapters = newLine; }
     notifySettingsChanged();
 }
 
 void ConfigManager::setNewLineBetweenBooks(bool newLine) {
-    config.newLineBetweenBooks = newLine;
+    { std::lock_guard<std::mutex> lock(configMutex); config.newLineBetweenBooks = newLine; }
     notifySettingsChanged();
 }
 
 void ConfigManager::setReferenceOnFirstLine(bool referenceFirst) {
-    config.referenceOnFirstLine = referenceFirst;
+    { std::lock_guard<std::mutex> lock(configMutex); config.referenceOnFirstLine = referenceFirst; }
     notifySettingsChanged();
 }
 
 void ConfigManager::setDynamicReference(bool dynamic) {
-    config.dynamicReference = dynamic;
+    { std::lock_guard<std::mutex> lock(configMutex); config.dynamicReference = dynamic; }
     notifySettingsChanged();
 }
 

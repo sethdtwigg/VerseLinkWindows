@@ -2,6 +2,7 @@
 #include "ConfigManager.h"
 #include "Logger.h"
 #include "SettingsDialog.h"
+#include "StringExtensions.h"
 #include <fstream>
 #include <sstream>
 #include <commctrl.h>
@@ -82,7 +83,7 @@ void SystemTray::Hide() {
 
 void SystemTray::UpdateTooltip(const std::string& tooltip) {
     if (tooltip.length() < sizeof(nid.szTip)/sizeof(WCHAR)) {
-        std::wstring wTooltip(tooltip.begin(), tooltip.end());
+        std::wstring wTooltip = StringExtensions::Utf8ToWide(tooltip);
         wcscpy_s(nid.szTip, sizeof(nid.szTip)/sizeof(WCHAR), wTooltip.c_str());
         if (isVisible) {
             Shell_NotifyIcon(NIM_MODIFY, &nid);
@@ -181,16 +182,17 @@ void SystemTray::ShowLogDialog() {
         logContent = buffer.str();
         logFile.close();
         
-        // Limit content size for display
+        // Keep the most recent content for display
         if (logContent.length() > 10000) {
-            logContent = logContent.substr(0, 10000) + "\n\n... (truncated for display)";
+            logContent = "... (older log entries truncated)\n\n" +
+                         logContent.substr(logContent.length() - 10000);
         }
     } else {
         logContent = "Log file not found or could not be opened:\n" + logPath;
     }
     
     std::wstring displayText = L"VerseLink Log Contents:\n\n";
-    displayText += std::wstring(logContent.begin(), logContent.end());
+    displayText += StringExtensions::Utf8ToWide(logContent);
     
     // Create a simple scrollable text display
     MessageBox(hwnd, displayText.c_str(), L"VerseLink Log", MB_OK | MB_ICONINFORMATION);
@@ -224,17 +226,19 @@ HICON SystemTray::LoadCustomIcon(const std::string& iconPath) {
     }
     
     // Convert to wide string
-    std::wstring wIconPath(iconPath.begin(), iconPath.end());
+    std::wstring wIconPath = StringExtensions::Utf8ToWide(iconPath);
     
     // Try multiple methods to load the icon
     
     // Method 1: Load as icon file (best for .ico files)
+    // No LR_SHARED: shared icons must never be passed to DestroyIcon, which
+    // Cleanup()/SetCustomIcon() do.
     HICON hIcon = (HICON)LoadImage(
         nullptr,
         wIconPath.c_str(),
         IMAGE_ICON,
         0, 0, // Use actual size from file
-        LR_LOADFROMFILE | LR_DEFAULTCOLOR | LR_SHARED
+        LR_LOADFROMFILE | LR_DEFAULTCOLOR
     );
     
     if (!hIcon) {
@@ -250,7 +254,7 @@ HICON SystemTray::LoadCustomIcon(const std::string& iconPath) {
             IMAGE_ICON,
             GetSystemMetrics(SM_CXSMICON),
             GetSystemMetrics(SM_CYSMICON),
-            LR_LOADFROMFILE | LR_DEFAULTCOLOR | LR_SHARED
+            LR_LOADFROMFILE | LR_DEFAULTCOLOR
         );
     }
     
@@ -274,19 +278,24 @@ void SystemTray::SetCustomIcon(const std::string& iconPath) {
     // Load new custom icon
     hCustomIcon = LoadCustomIcon(iconPath);
     
-    // Update system tray icon if visible and icon loaded successfully
-    if (isVisible && hCustomIcon) {
+    if (hCustomIcon) {
+        // Apply the icon to the tray data regardless of visibility, so a later
+        // Show() uses it. Only notify the shell when the icon is already shown.
         nid.hIcon = hCustomIcon;
-        if (Shell_NotifyIcon(NIM_MODIFY, &nid)) {
-            LogMessage("Updated system tray icon successfully");
-        } else {
+        if (isVisible && !Shell_NotifyIcon(NIM_MODIFY, &nid)) {
             LogMessage("Failed to update system tray icon");
+        } else if (isVisible) {
+            LogMessage("Updated system tray icon successfully");
         }
-    } else if (isVisible && !hCustomIcon) {
+    } else {
         // Fall back to default icon if custom failed
         nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-        if (Shell_NotifyIcon(NIM_MODIFY, &nid)) {
-            LogMessage("Reverted to default system tray icon");
+        if (isVisible) {
+            if (Shell_NotifyIcon(NIM_MODIFY, &nid)) {
+                LogMessage("Reverted to default system tray icon");
+            } else {
+                LogMessage("Failed to revert to default system tray icon");
+            }
         }
     }
 }

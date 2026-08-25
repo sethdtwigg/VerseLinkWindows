@@ -44,6 +44,21 @@ namespace Bible {
     bool IsValidBook(const std::string& bookName);
     std::vector<std::string> GetBookNames(); // Helper for book ranges
     int GetBookIndex(const std::string& bookName); // Helper for book ranges
+
+    // Locates a Bible XML file. Search order:
+    //   1. The given name/path verbatim (supports "Bibles/KJV.xml" style values)
+    //   2. <dataPathOverride>/<fileName> and dataPathOverride itself, if provided
+    //   3. Bibles/<fileName>, relative to the current working directory
+    //   4. <fileName> relative to the current working directory
+    //   5. Same as 2-4 but relative to the executable's directory
+    // Returns an empty string if no existing regular file is found.
+    std::string FindBibleFilePath(const std::string& fileName,
+                                  const std::string& dataPathOverride = "");
+
+    // Lists the *.xml Bible files available in the standard locations
+    // (dataPathOverride, Bibles/ and the executable/working directories).
+    // Returns file names only (e.g. "KJV.xml"), sorted, without duplicates.
+    std::vector<std::string> FindAvailableBibleVersions(const std::string& dataPathOverride = "");
 }
 
 #endif

@@ -1,8 +1,59 @@
-﻿#include "VerseRetrieveInterface.h"
+#include "VerseRetrieveInterface.h"
 #include "ConfigManager.h"
 #include <algorithm>
 #include <regex>
 #include <sstream>
+#include <map>
+#include <memory>
+#include <mutex>
+
+namespace {
+    // Parsed-Bible cache. Loading and parsing a full Bible XML is expensive
+    // (~4.7 MB for KJV), so documents are kept in memory per resolved path and
+    // re-loaded only when the file's last-write time changes on disk.
+    struct CachedBible {
+        FILETIME lastWrite{};
+        std::unique_ptr<tinyxml2::XMLDocument> doc;
+    };
+    std::mutex g_bibleCacheMutex;
+    std::map<std::string, CachedBible> g_bibleCache;
+
+    bool GetLastWriteTime(const std::string& path, FILETIME& out) {
+        WIN32_FILE_ATTRIBUTE_DATA fad{};
+        if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &fad)) {
+            return false;
+        }
+        out = fad.ftLastWriteTime;
+        return true;
+    }
+
+    const tinyxml2::XMLDocument* GetOrLoadBible(const std::string& path, std::string& errorOut) {
+        FILETIME ft{};
+        bool haveTimestamp = GetLastWriteTime(path, ft);
+
+        std::lock_guard<std::mutex> lock(g_bibleCacheMutex);
+        auto it = g_bibleCache.find(path);
+        if (it != g_bibleCache.end()) {
+            if (!haveTimestamp || CompareFileTime(&it->second.lastWrite, &ft) == 0) {
+                return it->second.doc.get(); // unchanged since load
+            }
+            // file changed on disk - fall through and reload
+        }
+
+        auto doc = std::unique_ptr<tinyxml2::XMLDocument>(new tinyxml2::XMLDocument());
+        if (doc->LoadFile(path.c_str()) != XML_SUCCESS) {
+            errorOut = doc->ErrorStr() ? doc->ErrorStr() : "unknown tinyxml2 error";
+            return nullptr;
+        }
+
+        CachedBible entry;
+        entry.lastWrite = ft;
+        entry.doc = std::move(doc);
+        const tinyxml2::XMLDocument* raw = entry.doc.get();
+        g_bibleCache[path] = std::move(entry);
+        return raw;
+    }
+}
 
 VerseRetrieveInterface::VerseRetrieveInterface(const std::string& selectedText, const std::string& version)
 {
@@ -51,23 +102,25 @@ bool VerseRetrieveInterface::parseSingleReference(const std::string& refStr) {
     LogMessage("Parsing reference: " + refStr);
     
     // Enhanced regex patterns for Bible references
+    // Order matters: more specific patterns first; single verse must be tried
+    // before multiple verses, otherwise "John 3:16" matches the [\d,]+ list pattern.
     std::vector<std::regex> patterns = {
         // Cross-chapter verse range with book repeated: "Romans 8:28 - Romans 9:1"
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+)\s*[-–—]\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+)\s*$)", std::regex_constants::icase),
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+)\s*[-��]\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+)\s*$)", std::regex_constants::icase),
         // Cross-chapter verse range: "Romans 8:28-9:1"
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+)\s*[-–—]\s*(\d+):(\d+)\s*$)", std::regex_constants::icase),
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+)\s*[-��]\s*(\d+):(\d+)\s*$)", std::regex_constants::icase),
         // Book range (e.g., "Jonah 1 - Micah 1")
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+)\s*[-–—]\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+)\s*$)", std::regex_constants::icase),
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+)\s*[-��]\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+)\s*$)", std::regex_constants::icase),
         // Book range without chapters (e.g., "Genesis - Exodus")
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s*[-–—]\s*([0-9]*\s*[a-zA-Z]+)\s*$)", std::regex_constants::icase),
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s*[-��]\s*([0-9]*\s*[a-zA-Z]+)\s*$)", std::regex_constants::icase),
         // Chapter range (e.g., "John 1-2")
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+)\s*[-–—]\s*(\d+)\s*$)", std::regex_constants::icase),
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+)\s*[-��]\s*(\d+)\s*$)", std::regex_constants::icase),
         // Book Chapter:Verse-EndVerse (e.g., "Romans 8:1-5")
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+)\s*[-–—]\s*(\d+)\s*$)", std::regex_constants::icase),
-        // Multiple verses (e.g., "John 3:16,18,20")
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):([\d,]+)\s*$)", std::regex_constants::icase),
-        // Book Chapter:Verse (e.g., "John 3:16")
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+)\s*[-��]\s*(\d+)\s*$)", std::regex_constants::icase),
+        // Book Chapter:Verse (e.g., "John 3:16") - must precede the comma-list pattern
         std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+)\s*$)", std::regex_constants::icase),
+        // Multiple verses (e.g., "John 3:16,18,20") - requires at least one comma
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+(?:\s*,\s*\d+)+)\s*$)", std::regex_constants::icase),
         // Book Chapter (e.g., "Genesis 1")
         std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+)\s*$)", std::regex_constants::icase)
     };
@@ -188,22 +241,7 @@ bool VerseRetrieveInterface::parseSingleReference(const std::string& refStr) {
                 br.IsRange = true;
                 LogMessage("Parsed verse range: " + bookName + " " + br.ChapterNumber + ":" + br.VerseNumber + "-" + br.EndVerseNumber);
                 
-            } else if (i == 6) { // Multiple verses: "John 3:16,18,20"
-                std::string bookName = Bible::NormalizeBookName(match[1].str());
-                
-                if (bookName.empty()) {
-                    LogMessage("Unknown book: " + match[1].str());
-                    return false;
-                }
-                
-                br.BookName = bookName;
-                br.ChapterNumber = match[2].str();
-                br.VerseNumber = match[3].str();
-                br.Type = Bible::ReferenceType::MULTIPLE_VERSES;
-                br.IsRange = false;
-                LogMessage("Parsed multiple verses: " + bookName + " " + br.ChapterNumber + ":" + br.VerseNumber);
-                
-            } else if (i == 7) { // Single verse: "John 3:16"
+            } else if (i == 6) { // Single verse: "John 3:16"
                 std::string bookName = Bible::NormalizeBookName(match[1].str());
                 
                 if (bookName.empty()) {
@@ -217,6 +255,21 @@ bool VerseRetrieveInterface::parseSingleReference(const std::string& refStr) {
                 br.Type = Bible::ReferenceType::SINGLE_VERSE;
                 br.IsRange = false;
                 LogMessage("Parsed single verse: " + bookName + " " + br.ChapterNumber + ":" + br.VerseNumber);
+                
+            } else if (i == 7) { // Multiple verses: "John 3:16,18,20"
+                std::string bookName = Bible::NormalizeBookName(match[1].str());
+                
+                if (bookName.empty()) {
+                    LogMessage("Unknown book: " + match[1].str());
+                    return false;
+                }
+                
+                br.BookName = bookName;
+                br.ChapterNumber = match[2].str();
+                br.VerseNumber = match[3].str();
+                br.Type = Bible::ReferenceType::MULTIPLE_VERSES;
+                br.IsRange = false;
+                LogMessage("Parsed multiple verses: " + bookName + " " + br.ChapterNumber + ":" + br.VerseNumber);
                 
             } else if (i == 8) { // Chapter only: "Genesis 1"
                 std::string bookName = Bible::NormalizeBookName(match[1].str());
@@ -249,7 +302,18 @@ bool VerseRetrieveInterface::parseBibleReference()
         return false;
     }
     
-    // Try to split multiple references first
+    // Try the input as a single reference first so formats that legitimately
+    // contain separators (e.g., "John 3:16,18,20") are not torn apart.
+    std::string trimmed = UserInput;
+    trimmed.erase(0, trimmed.find_first_not_of(" \t\n\r\f\v"));
+    trimmed.erase(trimmed.find_last_not_of(" \t\n\r\f\v") + 1);
+    
+    if (!trimmed.empty() && parseSingleReference(trimmed)) {
+        LogMessage("Successfully parsed 1 reference(s)");
+        return true;
+    }
+    
+    // Fall back to splitting multiple references (semicolons, commas, "and")
     auto refStrings = splitMultipleReferences(UserInput);
     
     bool success = false;
@@ -268,10 +332,10 @@ bool VerseRetrieveInterface::parseBibleReference()
     return success;
 }
 
-XMLElement* VerseRetrieveInterface::ParseXMLBible(XMLElement* node, const std::string& targetAttributeValue) {
+const XMLElement* VerseRetrieveInterface::ParseXMLBible(const XMLElement* node, const std::string& targetAttributeValue) {
     if (!node) return nullptr;
     
-    for (XMLElement* currentNode = node; currentNode; currentNode = currentNode->NextSiblingElement()) {
+    for (const XMLElement* currentNode = node; currentNode; currentNode = currentNode->NextSiblingElement()) {
         const char* attributeValue = currentNode->Attribute("n");
         if (attributeValue && std::string(attributeValue) == targetAttributeValue) {
             return currentNode;
@@ -280,7 +344,7 @@ XMLElement* VerseRetrieveInterface::ParseXMLBible(XMLElement* node, const std::s
     return nullptr;
 }
 
-std::string VerseRetrieveInterface::getVersesFromChapter(XMLElement* chapterNode, const std::string& startVerse, const std::string& endVerse) {
+std::string VerseRetrieveInterface::getVersesFromChapter(const XMLElement* chapterNode, const std::string& startVerse, const std::string& endVerse) {
     std::string result;
     
     if (!chapterNode) {
@@ -298,7 +362,7 @@ std::string VerseRetrieveInterface::getVersesFromChapter(XMLElement* chapterNode
         auto& config = ConfigManager::getInstance();
         bool includeVerseNumbers = config.includeVerseNumbers();
         
-        XMLElement* verseNode = chapterNode->FirstChildElement();
+        const XMLElement* verseNode = chapterNode->FirstChildElement();
         while (verseNode) {
             const char* verseNum = verseNode->Attribute("n");
             if (verseNum) {
@@ -328,7 +392,7 @@ std::string VerseRetrieveInterface::getVersesFromChapter(XMLElement* chapterNode
     return result;
 }
 
-std::string VerseRetrieveInterface::getMultipleVerses(XMLElement* chapterNode, const std::string& versesList) {
+std::string VerseRetrieveInterface::getMultipleVerses(const XMLElement* chapterNode, const std::string& versesList) {
     std::string result;
     
     if (!chapterNode) {
@@ -340,9 +404,18 @@ std::string VerseRetrieveInterface::getMultipleVerses(XMLElement* chapterNode, c
         // Parse comma-separated verse numbers
         std::vector<std::string> verses;
         std::stringstream ss(versesList);
-        std::string verseText;
-            
-        LogMessage("Getting multiple verses: " + versesList);
+        std::string item;
+        
+        while (std::getline(ss, item, ',')) {
+            item.erase(0, item.find_first_not_of(" \t"));
+            item.erase(item.find_last_not_of(" \t") + 1);
+            if (!item.empty()) {
+                verses.push_back(item);
+            }
+        }
+        
+        LogMessage("Getting multiple verses: " + versesList + " (" +
+                   std::to_string(verses.size()) + " verse(s))");
         
         for (const auto& verseNum : verses) {
             std::string verseText = getVersesFromChapter(chapterNode, verseNum, verseNum);
@@ -358,60 +431,40 @@ std::string VerseRetrieveInterface::getMultipleVerses(XMLElement* chapterNode, c
     return result;
 }
 
-std::string VerseRetrieveInterface::getChaptersFromBook(XMLElement* bookNode, const std::string& startChapter, const std::string& endChapter) {
-    std::string result;
-    
-    if (!bookNode) {
-        LogMessage("Invalid book node");
-        return result;
-    }
-    
-    try {
-        int start = std::stoi(startChapter);
-        int end = endChapter.empty() ? start : std::stoi(endChapter);
-        
-        LogMessage("Getting chapters " + std::to_string(start) + " to " + std::to_string(end));
-        
-        XMLElement* chapterNode = bookNode->FirstChildElement();
-        int currentChapter = 1;
-        
-        while (chapterNode && currentChapter <= end) {
-            const char* chapterNum = chapterNode->Attribute("n");
-            if (chapterNum) {
-                currentChapter = std::stoi(chapterNum);
-                if (currentChapter >= start && currentChapter <= end) {
-                    // Get all verses in this chapter
-                    std::string chapterText = getVersesFromChapter(chapterNode, "1", "999");
-                    if (!chapterText.empty()) {
-                        if (!result.empty()) result += " ";
-                        result += chapterText;
-                    }
-                }
-            }
-            chapterNode = chapterNode->NextSiblingElement();
-            currentChapter++;
-        }
-    } catch (const std::exception& e) {
-        LogMessage("Error parsing chapter numbers: " + std::string(e.what()));
-    }
-    
-    return result;
-}
-
 bool VerseRetrieveInterface::GetVerseText() {
     try {
         std::string resultString = "";
 
-        tinyxml2::XMLDocument doc;
-        if (doc.LoadFile(BibleVersion.c_str()) != XML_SUCCESS) {
-           LogMessage("Error loading XML file: " + BibleVersion);
-            LastError = "Could not load Bible XML file: " + BibleVersion;
+        // Nothing parsed -> nothing to look up. Returning early prevents
+        // whitespace-only output from being treated as a successful lookup.
+        if (references.empty()) {
+            LastError = LastError.empty() ? "No valid Bible reference was recognized" : LastError;
             return false;
         }
 
-        LogMessage("Successfully loaded XML file");
-
+        // Resolve the Bible XML file location (data path override, Bibles/ folder,
+        // current dir, exe dir). The version string alone may be just a file name.
         auto& config = ConfigManager::getInstance();
+        std::string bibleFile = Bible::FindBibleFilePath(BibleVersion, config.getBibleDataPath());
+        if (bibleFile.empty()) {
+            LogMessage("Could not locate Bible XML file: " + BibleVersion);
+            LastError = "Could not locate Bible XML file: " + BibleVersion +
+                        " (searched Bibles/ folder, working directory, and executable directory)";
+            return false;
+        }
+
+        // Load (or reuse the cached) parsed document
+        const tinyxml2::XMLDocument* doc = nullptr;
+        {
+            std::string loadError;
+            doc = GetOrLoadBible(bibleFile, loadError);
+            if (!doc) {
+                LogMessage("Error loading XML file: " + bibleFile + " (" + loadError + ")");
+                LastError = "Could not load Bible XML file: " + bibleFile;
+                return false;
+            }
+        }
+
         std::string referenceText;
 
         // Add the reference to the result once, before the loop
@@ -467,7 +520,7 @@ bool VerseRetrieveInterface::GetVerseText() {
             target += addition;
         };
 
-        auto getBookText = [&](XMLElement* bookNode, int startChapter, int endChapter) -> std::string {
+        auto getBookText = [&](const XMLElement* bookNode, int startChapter, int endChapter) -> std::string {
             std::string bookText;
             if (!bookNode) return bookText;
 
@@ -488,7 +541,12 @@ bool VerseRetrieveInterface::GetVerseText() {
 
         for (const auto& ref : references) {
             std::string verseText;
-            XMLElement* currentNode = doc.RootElement()->FirstChildElement();
+            const XMLElement* rootNode = doc->RootElement();
+            if (!rootNode) {
+                LogMessage("XML document has no root element");
+                continue;
+            }
+            const XMLElement* currentNode = rootNode->FirstChildElement();
             if (!currentNode) {
                 LogMessage("No child elements found in XML root");
                 continue;
@@ -611,6 +669,16 @@ bool VerseRetrieveInterface::GetVerseText() {
                     }
                     verseText = getMultipleVerses(chapterNode, ref.VerseNumber);
                         
+                } else if (ref.IsChapterOnly()) {
+                    // Whole chapter (e.g., "Genesis 1", "Psalm 23")
+                    LogMessage("Getting full chapter " + ref.BookName + " " + ref.ChapterNumber);
+                    auto chapterNode = ParseXMLBible(bookNode->FirstChildElement(), ref.ChapterNumber);
+                    if (!chapterNode) {
+                        LogMessage("Chapter not found: " + ref.BookName + " " + ref.ChapterNumber);
+                        continue;
+                    }
+                    verseText = getVersesFromChapter(chapterNode, "1", "999");
+                        
                 } else {
                     // Get single verse
                     LogMessage("Getting single verse " + ref.VerseNumber);
@@ -684,88 +752,17 @@ std::string VerseRetrieveInterface::prepareResult(const std::string& result) {
     cleaned = std::regex_replace(cleaned, multipleSpaces, " ");
     cleaned.erase(std::remove(cleaned.begin(), cleaned.end(), '\r'), cleaned.end());
 
-    // Trim whitespace
-    cleaned.erase(0, cleaned.find_first_not_of(" \t"));
-    cleaned.erase(cleaned.find_last_not_of(" \t") + 1);
+    // Trim all whitespace (including newlines) so whitespace-only results
+    // cannot masquerade as retrieved verse text
+    cleaned.erase(0, cleaned.find_first_not_of(" \t\n\r\f\v"));
+    if (!cleaned.empty()) {
+        cleaned.erase(cleaned.find_last_not_of(" \t\n\r\f\v") + 1);
+    }
     
     return cleaned;
 }
 
-std::string VerseRetrieveInterface::addVerseNumbers(const std::string& text) {
-    // Verse numbers are now handled during retrieval, so return text unchanged
-    return text;
-}
 
-std::string VerseRetrieveInterface::addNewLinesBetweenChapters(const std::string& text) {
-    std::string result;
-    std::istringstream iss(text);
-    std::string word;
-    int lastVerseNum = 0;
-    
-    while (iss >> word) {
-        // Check if this word is a verse number
-        if (!word.empty() && isdigit(word[0])) {
-            try {
-                int currentVerseNum = std::stoi(word);
-                // If verse number reset to 1 after higher numbers, likely new chapter
-                if (lastVerseNum > 0 && currentVerseNum == 1) {
-                    result += "\n";  // Add newline for chapter break
-                }
-                lastVerseNum = currentVerseNum;
-            } catch (...) {
-                // Not a number, continue
-            }
-        }
-        
-        result += word + " ";
-    }
-    
-    // Remove trailing space
-    if (!result.empty() && result.back() == ' ') {
-        result.pop_back();
-    }
-    
-    return result;
-}
-
-std::string VerseRetrieveInterface::AddNewLinesBetweenBooks(const std::string& text) {
-    std::string result;
-    std::istringstream iss(text);
-    std::string word;
-    int lastVerseNum = 0;
-    int resetCount = 0;
-    
-    while (iss >> word) {
-        // Check if this word is a verse number
-        if (!word.empty() && isdigit(word[0])) {
-            try {
-                int currentVerseNum = std::stoi(word);
-                // If verse number reset to 1 after higher numbers, likely new chapter
-                if (lastVerseNum > 0 && currentVerseNum == 1) {
-                    resetCount++;
-                    // If we've seen multiple resets, likely new book
-                    if (resetCount > 1) {
-                        result += "\n\n";  // Add double newline for book break
-                    } else {
-                        result += "\n";  // Add single newline for chapter break
-                    }
-                }
-                lastVerseNum = currentVerseNum;
-            } catch (...) {
-                // Not a number, continue
-            }
-        }
-        
-        result += word + " ";
-    }
-    
-    // Remove trailing space
-    if (!result.empty() && result.back() == ' ') {
-        result.pop_back();
-    }
-    
-    return result;
-}
 
 VerseRetrieveInterface::~VerseRetrieveInterface()
 {

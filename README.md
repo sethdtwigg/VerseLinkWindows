@@ -31,8 +31,7 @@ A Windows application that runs in the background and automatically replaces Bib
 
 - Windows 10 or later
 - Visual Studio 2019 or later (for building)
-- .NET Framework 4.7.2 or later (for UI Automation)
-- Bible XML files in the Bibles folder
+- Bible XML files in the `Bibles` folder
 
 ## Installation
 
@@ -95,14 +94,32 @@ The application uses `config.json` for settings. Here are the main options:
 
 ### Configuration Options
 
-- **bibleVersion**: XML file containing Bible text (must be in Bibles folder)
-- **hotkeyModifiers**: 3 = Ctrl+Alt, 2 = Ctrl, 1 = Alt
+- **bibleVersion**: XML file containing the Bible text. Resolved by searching:
+  1. The value as a direct path or relative to the working directory
+  2. `bibleDataPath/<bibleVersion>`, if **bibleDataPath** is set
+  3. `Bibles/<bibleVersion>` and `<bibleVersion>` next to the executable
+- **bibleDataPath**: Optional folder that overrides where Bible XML files are looked up
+- **hotkeyModifiers**: Bitmask - 1 = Alt, 2 = Ctrl, 4 = Shift, 8 = Win (combine by adding):
+
+  | Value | Combo |
+  |-------|-------|
+  | 2 | Ctrl |
+  | 3 | Ctrl + Alt |
+  | 6 | Ctrl + Shift |
+  | 7 | Ctrl + Alt + Shift |
+
+- **hotkeyVirtualKey**: 76 = 'L' key (ASCII code)
 - **hotkeyVirtualKey**: 76 = 'L' key (ASCII code)
 - **enableLogging**: Enable/disable logging
 - **debugMode**: Show console for debugging
 - **includeReferenceInReplacement**: Include reference in replacement text
 - **replacementFormat**: Format string (use `{reference}` and `{text}` placeholders)
 - **includeVerseNumbers**: Prefix each verse with its number
+- **preferDirectSelection**: Try UI Automation / edit controls before the clipboard fallback
+- **useExistingClipboard**: Restore your previous clipboard content after a replacement
+  (when disabled, the inserted verse text is left on the clipboard)
+- **logLevel**: 0 = Debug, 1 = Info, 2 = Warning, 3 = Error
+- **enableFileLogging** / **enableConsoleLogging**: Toggle log destinations
 - **newLineBetweenChapters**: Insert line break between chapters
 - **newLineBetweenBooks**: Insert line break between books
 - **referenceOnFirstLine**: Place reference on first line, verse text below
@@ -249,3 +266,8 @@ This project is provided as-is for educational and personal use.
 ---
 
 **Note**: This application modifies text content in other applications. Always verify the replacement text is correct before using in important documents.
+
+## Distribution
+
+Run `packaging\package.ps1` to build and bundle a release zip (exe, default config, icon, README, KJV Bible). Only the public-domain KJV is included - add licensed translations yourself.
+CI (`.github/workflows/ci.yml`) builds the test harness, runs it, and compiles the app on every push and pull request.

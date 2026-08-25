@@ -45,7 +45,7 @@ struct VerseLinkConfig {
     int notificationDurationMs = 3000;
     
     // Icon settings
-    std::string iconPath = "VLIcon.ico"; // Default to VLIcon.ico in same directory
+    std::string iconPath = ""; // Empty = use default application icon
     
     // Performance settings
     int maxConcurrentTasks = 1;
@@ -58,6 +58,10 @@ private:
     static std::mutex instanceMutex;
     
     VerseLinkConfig config;
+    // Guards `config` for concurrent access from the main/settings thread and
+    // the verse worker thread. Recursive-free: callbacks are always invoked
+    // with the lock released.
+    mutable std::mutex configMutex;
     std::string configFilePath;
     bool batchUpdate = false; // Flag to prevent callbacks during batch updates
     
@@ -78,27 +82,28 @@ public:
     bool load();
     bool save();
     
-    // Getters
-    const VerseLinkConfig& getConfig() const { return config; }
-    std::string getBibleVersion() const { return config.bibleVersion; }
-    std::string getBibleDataPath() const { return config.bibleDataPath; }
-    int getHotkeyModifiers() const { return config.hotkeyModifiers; }
-    int getHotkeyVirtualKey() const { return config.hotkeyVirtualKey; }
-    bool isLoggingEnabled() const { return config.enableLogging; }
-    bool isDebugMode() const { return config.debugMode; }
-    bool includeReferenceInReplacement() const { return config.includeReferenceInReplacement; }
-    std::string getReplacementFormat() const { return config.replacementFormat; }
-    std::string getLogFilePath() const { return config.logFilePath; }
-    std::string getIconPath() const { return config.iconPath; }
-    bool preferDirectSelection() const { return config.preferDirectSelection; }
-    bool useExistingClipboard() const { return config.useExistingClipboard; }
+    // Returns a snapshot copy; safe to hold/use across settings changes.
+    VerseLinkConfig getConfig() const;
+    // Thread-safe accessors (each locks internally)
+    std::string getBibleVersion() const;
+    std::string getBibleDataPath() const;
+    int getHotkeyModifiers() const;
+    int getHotkeyVirtualKey() const;
+    bool isLoggingEnabled() const;
+    bool isDebugMode() const;
+    bool includeReferenceInReplacement() const;
+    std::string getReplacementFormat() const;
+    std::string getLogFilePath() const;
+    std::string getIconPath() const;
+    bool preferDirectSelection() const;
+    bool useExistingClipboard() const;
     
     // Verse formatting getters
-    bool includeVerseNumbers() const { return config.includeVerseNumbers; }
-    bool newLineBetweenChapters() const { return config.newLineBetweenChapters; }
-    bool newLineBetweenBooks() const { return config.newLineBetweenBooks; }
-    bool referenceOnFirstLine() const { return config.referenceOnFirstLine; }
-    bool dynamicReference() const { return config.dynamicReference; }
+    bool includeVerseNumbers() const;
+    bool newLineBetweenChapters() const;
+    bool newLineBetweenBooks() const;
+    bool referenceOnFirstLine() const;
+    bool dynamicReference() const;
     
     // Setters
     void setBibleVersion(const std::string& version);

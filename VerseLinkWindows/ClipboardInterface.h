@@ -6,11 +6,18 @@
 #include <windows.h>
 #include <uiautomation.h>
 #include <memory>
+#include <string>
+#include <vector>
+
+// RAII helper defined in ClipboardInterface.cpp; held per-instance so every
+// thread that uses UI Automation gets its own CoInitialize/CoUninitialize pair.
+struct COMInitializer;
 
 class ClipboardInterface
 {
     HWND m_target_window = NULL;
     std::string m_last_error;
+    std::unique_ptr<COMInitializer> m_com;
     
     // UI Automation helpers
     std::string GetSelectedTextUsingUIAutomation();

@@ -1,6 +1,8 @@
 #include "Bible.h"
 #include <algorithm>
 #include <cctype>
+#include <set>
+#include <windows.h>
 
 namespace Bible {
     // Use static const to reduce stack usage and ensure single initialization
@@ -93,8 +95,10 @@ namespace Bible {
     std::string NormalizeBookName(const std::string& bookName) {
         std::string normalized = bookName;
         
-        // Convert to lowercase for case-insensitive matching
-        std::transform(normalized.begin(), normalized.end(), normalized.begin(), ::tolower);
+        // Convert to lowercase for case-insensitive matching (unsigned char
+        // cast avoids UB for non-ASCII bytes)
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         
         // Trim whitespace
         normalized.erase(0, normalized.find_first_not_of(" \t\n\r\f\v"));
@@ -109,7 +113,8 @@ namespace Bible {
         // If not found in aliases, try exact match (case-insensitive)
         for (const auto& book : BibleBookOrder) {
             std::string bookLower = book;
-            std::transform(bookLower.begin(), bookLower.end(), bookLower.begin(), ::tolower);
+            std::transform(bookLower.begin(), bookLower.end(), bookLower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
             if (bookLower == normalized) {
                 return book;
             }
@@ -137,5 +142,97 @@ namespace Bible {
             }
         }
         return -1;
+    }
+
+    namespace {
+        bool IsExistingFile(const std::string& path) {
+            DWORD attrs = GetFileAttributesA(path.c_str());
+            return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+        }
+    }
+
+    std::string FindBibleFilePath(const std::string& fileName,
+                                  const std::string& dataPathOverride) {
+        if (fileName.empty()) return "";
+
+        std::vector<std::string> candidates;
+
+        auto join = [](const std::string& dir, const std::string& name) {
+            if (dir.empty()) return name;
+            char last = dir.back();
+            if (last == '\\' || last == '/') return dir + name;
+            return dir + "\\" + name;
+        };
+
+        // 1) Verbatim (already a full/relative path, or plain name in CWD)
+        candidates.push_back(fileName);
+
+        // 2) Explicit data path override
+        if (!dataPathOverride.empty()) {
+            candidates.push_back(join(dataPathOverride, fileName));
+            candidates.push_back(dataPathOverride); // override may itself be the file
+        }
+
+        // 3) Bibles/ folder and 4) bare name, relative to CWD
+        candidates.push_back(join("Bibles", fileName));
+        candidates.push_back(fileName); // duplicate verbatim is harmless; keeps order readable
+
+        // 5) Same set relative to the executable directory
+        char exePath[MAX_PATH] = {};
+        if (GetModuleFileNameA(nullptr, exePath, MAX_PATH) > 0) {
+            std::string exeDir(exePath);
+            size_t slash = exeDir.find_last_of("\\/");
+            if (slash != std::string::npos) {
+                exeDir = exeDir.substr(0, slash);
+                candidates.push_back(join(join(exeDir, "Bibles"), fileName));
+                candidates.push_back(join(exeDir, fileName));
+            }
+        }
+
+        for (const auto& candidate : candidates) {
+            if (!candidate.empty() && IsExistingFile(candidate)) {
+                return candidate;
+            }
+        }
+        return "";
+    }
+
+    std::vector<std::string> FindAvailableBibleVersions(const std::string& dataPathOverride) {
+        std::set<std::string> found;
+
+        auto scanDir = [&found](const std::string& dir) {
+            if (dir.empty()) return;
+            WIN32_FIND_DATAA fd{};
+            std::string pattern = dir;
+            char last = pattern.back();
+            if (last != '\\' && last != '/') pattern += "\\";
+            pattern += "*.xml";
+            HANDLE hFind = FindFirstFileA(pattern.c_str(), &fd);
+            if (hFind == INVALID_HANDLE_VALUE) return;
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                found.insert(fd.cFileName);
+            } while (FindNextFileA(hFind, &fd));
+            FindClose(hFind);
+        };
+
+        if (!dataPathOverride.empty()) {
+            scanDir(dataPathOverride);
+        }
+
+        char exePath[MAX_PATH] = {};
+        if (GetModuleFileNameA(nullptr, exePath, MAX_PATH) > 0) {
+            std::string exeDir(exePath);
+            size_t slash = exeDir.find_last_of("\\/");
+            if (slash != std::string::npos) {
+                exeDir = exeDir.substr(0, slash);
+                scanDir(exeDir + "\\Bibles");
+                scanDir(exeDir);
+            }
+        }
+        scanDir("Bibles");
+        scanDir(".");
+
+        return std::vector<std::string>(found.begin(), found.end());
     }
 }

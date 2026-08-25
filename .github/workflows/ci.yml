@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test-and-build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC environment (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build and run test harness
+        shell: cmd
+        run: |
+          cl /nologo /EHsc /O2 /std:c++20 /W3 /IVerseLinkWindows tests\test_harness.cpp VerseLinkWindows\Bible.cpp VerseLinkWindows\ConfigManager.cpp VerseLinkWindows\Logger.cpp VerseLinkWindows\StringExtensions.cpp VerseLinkWindows\tinyxml2.cpp VerseLinkWindows\VerseRetrieveInterface.cpp /Fe:tests\test_harness.exe
+          if errorlevel 1 exit /b 1
+          cd .
+          tests\test_harness.exe
+          if errorlevel 1 exit /b 1
+
+      - name: Build application (Release x64)
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          & "$vsRoot\MSBuild\Current\Bin\MSBuild.exe" "VerseLinkWindows\VerseLinkWindows.vcxproj" /p:Configuration=Release /p:Platform=x64 /m /v:m /nologo
+          exit $LASTEXITCODE
+
+      - name: Upload built exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: VerseLinkWindows-x64
+          path: VerseLinkWindows/x64/Release/VerseLinkWindows.exe
+          if-no-files-found: error

@@ -2,11 +2,34 @@
 #include "ConfigManager.h"
 #include "Logger.h"
 #include "SystemTray.h"
+#include "StringExtensions.h"
+#include "VerseLinkWindows.h"
+#include "Bible.h"
 #include <commctrl.h>
 
 #pragma comment(lib, "comctl32.lib")
 
 SettingsDialog* SettingsDialog::instance = nullptr;
+
+namespace {
+    bool EnsureSettingsClassRegistered() {
+        static bool registered = false;
+        if (registered) return true;
+
+        WNDCLASS wc = {};
+        wc.lpfnWndProc = SettingsDialog::DialogProc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.lpszClassName = L"VerseLinkSettingsDialog";
+
+        if (!RegisterClass(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+            return false;
+        }
+        registered = true;
+        return true;
+    }
+}
 
 SettingsDialog::SettingsDialog(HWND parentHwnd) : hParent(parentHwnd), hwnd(nullptr) {
 }
@@ -20,28 +43,16 @@ SettingsDialog::~SettingsDialog() {
 bool SettingsDialog::Show() {
     instance = this;
     
-    // Use a unique class name each time to avoid registration conflicts
-    static int dialogCounter = 0;
-    dialogCounter++;
-    std::wstring className = L"VerseLinkSettingsDialog_" + std::to_wstring(dialogCounter);
-    
-    // Register a proper dialog window class with background
-    WNDCLASS wc = {};
-    wc.lpfnWndProc = DialogProc;
-    wc.hInstance = GetModuleHandle(nullptr);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); // Standard window background
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.lpszClassName = className.c_str();
-    
-    if (!RegisterClass(&wc)) {
+    if (!EnsureSettingsClassRegistered()) {
         LogMessage("Failed to register dialog class");
+        instance = nullptr;
         return false;
     }
     
     // Create dialog window with proper class
     hwnd = CreateWindowEx(
         WS_EX_DLGMODALFRAME | WS_EX_APPWINDOW,
-        className.c_str(), // Use registered class
+        L"VerseLinkSettingsDialog",
         L"VerseLink Settings",
         WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | WS_THICKFRAME,
         100, 100, 450, 420, // Proper size
@@ -53,6 +64,7 @@ bool SettingsDialog::Show() {
     
     if (!hwnd) {
         LogMessage("Failed to create settings dialog");
+        instance = nullptr;
         return false;
     }
     
@@ -63,9 +75,22 @@ bool SettingsDialog::Show() {
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
     
-    // Modal message loop - simplified to prevent hanging
+    // Modal message loop. While it runs, thread messages (no target window)
+    // arrive here instead of the main loop, so they must be handled explicitly:
+    // - WM_QUIT is re-posted so the main message loop can shut the app down.
+    // - WM_HOTKEY would otherwise be silently dropped by DispatchMessage.
     MSG msg;
     while (GetMessage(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_QUIT) {
+            PostQuitMessage(static_cast<int>(msg.wParam));
+            break;
+        }
+        
+        if (msg.message == WM_HOTKEY && msg.wParam == MY_HOTKEY_ID) {
+            QueueHotkeyTask();
+            continue; // keep servicing the dialog
+        }
+        
         if (!IsDialogMessage(hwnd, &msg)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
@@ -75,6 +100,10 @@ bool SettingsDialog::Show() {
         if (!IsWindow(hwnd)) {
             break;
         }
+    }
+    
+    if (instance == this) {
+        instance = nullptr;
     }
     
     return true;
@@ -97,11 +126,11 @@ void SettingsDialog::CreateControls() {
     
     int currentY = START_Y;
     
-    // Bible Version
+    // Bible Version (drop-down of discovered Bible XML files)
     CreateWindowW(L"STATIC", L"Bible Version:", WS_VISIBLE | WS_CHILD,
         START_X, currentY, LABEL_WIDTH, FIELD_HEIGHT, hwnd, nullptr, GetModuleHandle(nullptr), nullptr);
-    CreateWindowW(L"EDIT", L"", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
-        START_X + LABEL_WIDTH + HORIZONTAL_SPACING, currentY, FIELD_WIDTH, FIELD_HEIGHT, hwnd, (HMENU)ID_BIBLE_VERSION, GetModuleHandle(nullptr), nullptr);
+    CreateWindowW(L"COMBOBOX", L"", WS_VISIBLE | WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+        START_X + LABEL_WIDTH + HORIZONTAL_SPACING, currentY, FIELD_WIDTH, 200, hwnd, (HMENU)ID_BIBLE_VERSION, GetModuleHandle(nullptr), nullptr);
     currentY += VERTICAL_SPACING;
     
     // Debug Mode
@@ -198,6 +227,37 @@ void SettingsDialog::CreateControls() {
         START_X + (buttonWidth + buttonSpacing) * 2, buttonY, buttonWidth + 40, buttonHeight, hwnd, (HMENU)ID_RESET_DEFAULTS, GetModuleHandle(nullptr), nullptr);
 }
 
+void SettingsDialog::PopulateBibleVersions(const std::string& currentVersion) {
+    HWND hCombo = GetDlgItem(hwnd, ID_BIBLE_VERSION);
+    if (!hCombo) return;
+
+    SendMessage(hCombo, CB_RESETCONTENT, 0, 0);
+
+    std::string current = currentVersion;
+    if (current.empty()) {
+        current = ConfigManager::getInstance().getBibleVersion();
+    }
+
+    auto versions = Bible::FindAvailableBibleVersions(ConfigManager::getInstance().getBibleDataPath());
+    bool hasCurrent = false;
+    for (const auto& version : versions) {
+        // UTF-8 -> wide for display
+        std::wstring wide = StringExtensions::Utf8ToWide(version);
+        LRESULT index = SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)wide.c_str());
+        if (!hasCurrent && _wcsicmp(wide.c_str(), StringExtensions::Utf8ToWide(current).c_str()) == 0) {
+            hasCurrent = true;
+            SendMessage(hCombo, CB_SETCURSEL, index, 0);
+        }
+    }
+
+    if (!current.empty() && !hasCurrent) {
+        // Current value is not on disk (e.g. file removed); keep it selectable.
+        std::wstring wide = StringExtensions::Utf8ToWide(current);
+        LPARAM index = SendMessageW(hCombo, CB_ADDSTRING, 0, (LPARAM)wide.c_str());
+        SendMessage(hCombo, CB_SETCURSEL, index, 0);
+    }
+}
+
 void SettingsDialog::LoadCurrentSettings() {
     auto& config = ConfigManager::getInstance();
     
@@ -219,7 +279,7 @@ void SettingsDialog::LoadCurrentSettings() {
     originalValues[ID_DYNAMIC_REFERENCE] = config.dynamicReference() ? "true" : "false";
     
     // Set control values
-    SetControlText(ID_BIBLE_VERSION, config.getBibleVersion());
+    PopulateBibleVersions(config.getBibleVersion());
     SetControlChecked(ID_DEBUG_MODE, config.isDebugMode());
     SetControlChecked(ID_INCLUDE_REFERENCE, config.includeReferenceInReplacement());
     SetControlChecked(ID_PREFER_DIRECT_SELECTION, config.preferDirectSelection());
@@ -305,7 +365,7 @@ void SettingsDialog::ResetToDefaults() {
         SetControlChecked(ID_ENABLE_LOGGING, true);
         SetControlText(ID_LOG_FILE_PATH, "verselink.log");
         SetControlText(ID_REPLACEMENT_FORMAT, "{reference} {text}");
-        SetControlText(ID_ICON_PATH, "VLIcon.ico");
+        SetControlText(ID_ICON_PATH, ""); // empty = use default icon
         // Reset verse formatting controls to defaults
         SetControlChecked(ID_INCLUDE_VERSE_NUMBERS, false);
         SetControlChecked(ID_NEWLINE_BETWEEN_CHAPTERS, false);
@@ -320,11 +380,14 @@ void SettingsDialog::ResetToDefaults() {
 std::string SettingsDialog::GetControlText(int controlId) {
     HWND hControl = GetDlgItem(hwnd, controlId);
     if (hControl) {
-        int length = GetWindowTextLength(hControl);
+        int length = GetWindowTextLengthW(hControl);
         if (length > 0) {
-            std::string text(length + 1, '\0');
-            GetWindowTextA(hControl, &text[0], length + 1);
-            return text;
+            std::wstring wide(length + 1, L'\0');
+            int copied = GetWindowTextW(hControl, &wide[0], length + 1);
+            wide.resize(copied > 0 ? copied : 0);
+            // WideToUtf8 of the resized string contains no embedded terminator,
+            // so comparisons against stored values behave correctly.
+            return StringExtensions::WideToUtf8(wide);
         }
     }
     return "";
@@ -332,9 +395,24 @@ std::string SettingsDialog::GetControlText(int controlId) {
 
 void SettingsDialog::SetControlText(int controlId, const std::string& text) {
     HWND hControl = GetDlgItem(hwnd, controlId);
-    if (hControl) {
-        SetWindowTextW(hControl, std::wstring(text.begin(), text.end()).c_str());
+    if (!hControl) return;
+
+    // Combo boxes need item selection rather than window text
+    wchar_t className[32] = {};
+    GetClassNameW(hControl, className, 32);
+    if (_wcsicmp(className, L"combobox") == 0) {
+        std::wstring wide = StringExtensions::Utf8ToWide(text);
+        LRESULT index = SendMessageW(hControl, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)wide.c_str());
+        if (index == CB_ERR) {
+            index = SendMessageW(hControl, CB_ADDSTRING, 0, (LPARAM)wide.c_str());
+        }
+        if (index != CB_ERR) {
+            SendMessage(hControl, CB_SETCURSEL, index, 0);
+        }
+        return;
     }
+
+    SetWindowTextW(hControl, StringExtensions::Utf8ToWide(text).c_str());
 }
 
 bool SettingsDialog::GetControlChecked(int controlId) {
@@ -385,11 +463,8 @@ void SettingsDialog::BrowseForIcon() {
     }
 }
 
-INT_PTR CALLBACK SettingsDialog::DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
+LRESULT CALLBACK SettingsDialog::DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
-        case WM_INITDIALOG:
-            return TRUE;
-            
         case WM_PAINT:
             {
                 PAINTSTRUCT ps;
@@ -402,7 +477,7 @@ INT_PTR CALLBACK SettingsDialog::DialogProc(HWND hDlg, UINT message, WPARAM wPar
                 FillRect(hdc, &rect, hBrush);
                 
                 EndPaint(hDlg, &ps);
-                return TRUE;
+                return 0;
             }
             
         case WM_COMMAND:
@@ -412,33 +487,38 @@ INT_PTR CALLBACK SettingsDialog::DialogProc(HWND hDlg, UINT message, WPARAM wPar
                         instance->SaveSettings();
                     }
                     DestroyWindow(hDlg);
-                    return TRUE;
+                    return 0;
                     
                 case ID_CANCEL:
                     DestroyWindow(hDlg);
-                    return TRUE;
+                    return 0;
                     
                 case ID_RESET_DEFAULTS:
                     if (instance) {
                         instance->ResetToDefaults();
                     }
-                    return TRUE;
+                    return 0;
                     
                 case ID_BROWSE_ICON:
                     if (instance) {
                         instance->BrowseForIcon();
                     }
-                    return TRUE;
+                    return 0;
             }
             break;
             
         case WM_CLOSE:
             DestroyWindow(hDlg);
-            return TRUE;
+            return 0;
             
         case WM_DESTROY:
-            // Don't call PostQuitMessage - it closes the entire app
-            return TRUE;
+            // Don't call PostQuitMessage - it closes the entire app.
+            // Clear the stale instance pointer so it is never dereferenced
+            // after the window is gone.
+            if (instance && instance->hwnd == hDlg) {
+                instance->hwnd = nullptr;
+            }
+            return 0;
     }
     
     return DefWindowProc(hDlg, message, wParam, lParam);

@@ -1,7 +1,7 @@
 {
   "bibleVersion": "KJV.xml",
   "bibleDataPath": "",
-  "hotkeyModifiers": 6,
+  "hotkeyModifiers": 3,
   "hotkeyVirtualKey": 76,
   "enableLogging": true,
   "enableFileLogging": true,

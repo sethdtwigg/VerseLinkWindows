@@ -12,6 +12,32 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Literal Unicode punctuation in these sources has been silently
+      # re-encoded before (en/em dashes in the reference regexes became U+FFFD),
+      # which broke every verse range without failing the build. Sources stay
+      # ASCII-only; escapes such as "\xE2\x80\x93" express non-ASCII bytes.
+      - name: Check sources are ASCII-only
+        shell: pwsh
+        run: |
+          $offenders = @()
+          Get-ChildItem -Path VerseLinkWindows, tests -Include *.cpp, *.h -Recurse |
+            Where-Object { $_.Name -notlike 'tinyxml2.*' } |
+            ForEach-Object {
+                $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
+                for ($i = 0; $i -lt $bytes.Length; $i++) {
+                    if ($bytes[$i] -gt 127) {
+                        $offenders += ('{0}: first non-ASCII byte 0x{1:X2} at offset {2}' -f $_.FullName, $bytes[$i], $i)
+                        break
+                    }
+                }
+            }
+          if ($offenders.Count -gt 0) {
+            Write-Host "Non-ASCII bytes found in source files:"
+            $offenders | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          Write-Host "All sources are ASCII-only."
+
       - name: Setup MSVC environment (x64)
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -20,9 +46,8 @@ jobs:
       - name: Build and run test harness
         shell: cmd
         run: |
-          cl /nologo /EHsc /O2 /std:c++20 /W3 /IVerseLinkWindows tests\test_harness.cpp VerseLinkWindows\Bible.cpp VerseLinkWindows\ConfigManager.cpp VerseLinkWindows\Logger.cpp VerseLinkWindows\StringExtensions.cpp VerseLinkWindows\tinyxml2.cpp VerseLinkWindows\VerseRetrieveInterface.cpp /Fe:tests\test_harness.exe
+          cl /nologo /EHsc /O2 /std:c++20 /utf-8 /W3 /IVerseLinkWindows tests\test_harness.cpp VerseLinkWindows\Bible.cpp VerseLinkWindows\ConfigManager.cpp VerseLinkWindows\Logger.cpp VerseLinkWindows\StringExtensions.cpp VerseLinkWindows\TaskQueue.cpp VerseLinkWindows\VerseFormatter.cpp VerseLinkWindows\tinyxml2.cpp VerseLinkWindows\VerseRetrieveInterface.cpp /Fe:tests\test_harness.exe
           if errorlevel 1 exit /b 1
-          cd .
           tests\test_harness.exe
           if errorlevel 1 exit /b 1
 
@@ -33,6 +58,14 @@ jobs:
           $vsRoot = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
           & "$vsRoot\MSBuild\Current\Bin\MSBuild.exe" "VerseLinkWindows\VerseLinkWindows.vcxproj" /p:Configuration=Release /p:Platform=x64 /m /v:m /nologo
           exit $LASTEXITCODE
+
+      # Exercises the shipped binary's real lookup and formatting path - the same
+      # code VerseLinkTask runs - across every formatting setting, with no GUI.
+      - name: Run headless self test
+        shell: cmd
+        run: |
+          VerseLinkWindows\x64\Release\VerseLinkWindows.exe --selftest
+          if errorlevel 1 exit /b 1
 
       - name: Upload built exe
         uses: actions/upload-artifact@v4

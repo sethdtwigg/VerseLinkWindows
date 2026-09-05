@@ -10,6 +10,9 @@
 #include "ConfigManager.h"
 #include "Logger.h"
 #include "StringExtensions.h"
+#include "TaskQueue.h"
+#include "VerseFormatter.h"
+#include "tinyxml2.h"
 
 #include <windows.h>
 #include <iostream>
@@ -20,6 +23,7 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 
 static int g_checks = 0;
@@ -311,14 +315,67 @@ static void TestConfigRoundTrip() {
     CHECK(cm.getBibleDataPath() == "X:/bibles", "bibleDataPath loaded from file (got '" +
           cm.getBibleDataPath() + "')");
 
-    // Round-trip through save()
+    // Round-trip through save(), asserted against the bytes actually written.
+    //
+    // Re-reading the singleton proves nothing: ConfigManager::initialize()
+    // reloads into the same instance and load() never resets to defaults, so
+    // the previous version of these checks passed even if save() wrote nothing.
     CHECK(cm.save(), "config save succeeds");
-    ConfigManager::initialize(cfgPath); // reloads into same singleton
-    auto& cm2 = ConfigManager::getInstance();
-    CHECK(cm2.getHotkeyModifiers() == 6 && cm2.getHotkeyVirtualKey() == 74,
-          "hotkey survives save/reload");
-    CHECK(cm2.includeVerseNumbers() && cm2.dynamicReference(), "format flags survive save/reload");
-    CHECK(cm2.getReplacementFormat() == "{reference}: {text}", "replacementFormat survives save/reload");
+
+    std::string written;
+    {
+        std::ifstream saved(cfgPath);
+        std::stringstream buffer;
+        buffer << saved.rdbuf();
+        written = buffer.str();
+    }
+    CHECK(!written.empty(), "saved config file is not empty");
+
+    const char* expectedPairs[] = {
+        "\"hotkeyModifiers\": 6",
+        "\"hotkeyVirtualKey\": 74",
+        "\"logFilePath\": \"custom.log\"",
+        "\"bibleDataPath\": \"X:/bibles\"",
+        "\"includeVerseNumbers\": true",
+        "\"dynamicReference\": true",
+        "\"replacementFormat\": \"{reference}: {text}\"",
+    };
+    for (const char* pair : expectedPairs) {
+        CHECK(written.find(pair) != std::string::npos,
+              std::string("saved config should contain ") + pair);
+    }
+
+    // Prove load() actually reads the file: point the singleton at one whose
+    // values all differ, and require every one of them to change.
+    const std::string reloadPath = "tests/test_config_reload.json";
+    {
+        std::ofstream f(reloadPath);
+        f << "{\n"
+             "  \"bibleVersion\": \"NASB.xml\",\n"
+             "  \"bibleDataPath\": \"Y:/other\",\n"
+             "  \"hotkeyModifiers\": 5,\n"
+             "  \"hotkeyVirtualKey\": 75,\n"
+             "  \"logFilePath\": \"other.log\",\n"
+             "  \"includeVerseNumbers\": false,\n"
+             "  \"dynamicReference\": false,\n"
+             "  \"replacementFormat\": \"{text}\"\n"
+             "}\n";
+    }
+
+    ConfigManager::initialize(reloadPath);
+    auto& reloaded = ConfigManager::getInstance();
+    CHECK(reloaded.getHotkeyModifiers() == 5 && reloaded.getHotkeyVirtualKey() == 75,
+          "load() replaces the hotkey (got " + std::to_string(reloaded.getHotkeyModifiers()) +
+          "/" + std::to_string(reloaded.getHotkeyVirtualKey()) + ")");
+    CHECK(reloaded.getLogFilePath() == "other.log", "load() replaces logFilePath");
+    CHECK(reloaded.getBibleDataPath() == "Y:/other", "load() replaces bibleDataPath");
+    CHECK(reloaded.getReplacementFormat() == "{text}", "load() replaces replacementFormat");
+    CHECK(!reloaded.includeVerseNumbers() && !reloaded.dynamicReference(),
+          "load() replaces the formatting flags");
+
+    // Leave the singleton somewhere harmless for the sections that follow.
+    reloaded.setBibleDataPath("");
+    reloaded.setBibleVersion("KJV.xml");
 }
 
 static void TestBibleVersionDiscovery() {
@@ -401,12 +458,482 @@ static void TestLogRotation() {
     Logger::initialize("verselink.log", Info, true, true);
 }
 
+// ---------------------------------------------------------------------------
+// Reference normalisation: the range failure
+// ---------------------------------------------------------------------------
+
+static void TestDashVariants() {
+    BeginSection("Dash and whitespace variants");
+
+    // Written as byte escapes so this file stays ASCII-only. A literal dash here
+    // is exactly what got silently re-encoded to U+FFFD and broke every range.
+    const struct { const char* name; const char* input; } variants[] = {
+        { "ascii hyphen",        "Romans 8:1-5" },
+        { "en dash",             "Romans 8:1\xE2\x80\x93" "5" },
+        { "em dash",             "Romans 8:1\xE2\x80\x94" "5" },
+        { "non-breaking hyphen", "Romans 8:1\xE2\x80\x91" "5" },
+        { "figure dash",         "Romans 8:1\xE2\x80\x92" "5" },
+        { "horizontal bar",      "Romans 8:1\xE2\x80\x95" "5" },
+        { "minus sign",          "Romans 8:1\xE2\x88\x92" "5" },
+        { "nbsp around dash",    "Romans 8:1\xC2\xA0-\xC2\xA0" "5" },
+        { "replacement char",    "Romans 8:1\xEF\xBF\xBD" "5" },
+        { "zero-width space",    "Romans 8:1-\xE2\x80\x8B" "5" },
+        { "leading BOM",         "\xEF\xBB\xBF" "Romans 8:1-5" },
+    };
+
+    for (const auto& variant : variants) {
+        auto refs = Parse(variant.input);
+        const std::string label = std::string("range with ") + variant.name;
+        CHECK(refs.size() == 1, label + " should parse to one reference");
+        if (refs.size() != 1) continue;
+        CHECK(refs[0].BookName == "Romans" && refs[0].ChapterNumber == "8" &&
+              refs[0].VerseNumber == "1" && refs[0].EndVerseNumber == "5",
+              label + " should yield Romans 8:1-5, got " + refs[0].BookName + " " +
+              refs[0].ChapterNumber + ":" + refs[0].VerseNumber + "-" + refs[0].EndVerseNumber);
+    }
+
+    // The normaliser itself, independent of parsing.
+    using StringExtensions::NormalizeReferenceText;
+    CHECK(NormalizeReferenceText("Romans 8:1\xE2\x80\x93" "5") == "Romans 8:1-5",
+          "en dash folds to ASCII hyphen");
+    CHECK(NormalizeReferenceText("John\xC2\xA0" "3:16") == "John 3:16",
+          "non-breaking space folds to a plain space");
+    CHECK(NormalizeReferenceText("John\xE2\x80\x8B" "3:16") == "John3:16",
+          "zero-width space is dropped");
+    CHECK(NormalizeReferenceText("plain ascii") == "plain ascii",
+          "ASCII text passes through untouched");
+    CHECK(NormalizeReferenceText("") == "", "empty input handled");
+    // Invalid UTF-8 must survive rather than be mangled further.
+    CHECK(NormalizeReferenceText("\xFF\xFE") == "\xFF\xFE",
+          "invalid UTF-8 bytes pass through unchanged");
+    // Non-punctuation multibyte content must be preserved exactly.
+    const std::string greek = "\xCE\xA7\xCE\xAC\xCF\x81\xCE\xB9\xCF\x82";
+    CHECK(NormalizeReferenceText(greek) == greek, "other multibyte text is preserved");
+}
+
+// ---------------------------------------------------------------------------
+// Range completeness, checked against the XML rather than against hardcoded text
+// ---------------------------------------------------------------------------
+
+// Collapses every run of whitespace to one space and trims, so oracle text and
+// retrieved text can be compared without depending on separator settings.
+static std::string Squeeze(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    bool inSpace = false;
+    for (char c : text) {
+        const bool isSpace = (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v');
+        if (isSpace) {
+            inSpace = true;
+            continue;
+        }
+        if (inSpace && !out.empty()) out += ' ';
+        inSpace = false;
+        out += c;
+    }
+    return out;
+}
+
+// Walks the Bible XML directly to build the set of verses a span should contain.
+// Deliberately independent of VerseRetrieveInterface, so this is a real oracle
+// and not a restatement of the code under test.
+static std::vector<std::string> OracleVerses(const std::string& biblePath,
+                                             const std::string& book,
+                                             int chapter, int startVerse, int endVerse) {
+    std::vector<std::string> verses;
+    tinyxml2::XMLDocument doc;
+    if (doc.LoadFile(biblePath.c_str()) != tinyxml2::XML_SUCCESS) return verses;
+
+    const tinyxml2::XMLElement* root = doc.RootElement();
+    if (!root) return verses;
+
+    for (const tinyxml2::XMLElement* b = root->FirstChildElement(); b; b = b->NextSiblingElement()) {
+        const char* bookName = b->Attribute("n");
+        if (!bookName || book != bookName) continue;
+
+        for (const tinyxml2::XMLElement* c = b->FirstChildElement(); c; c = c->NextSiblingElement()) {
+            const char* chapterNumber = c->Attribute("n");
+            if (!chapterNumber || std::atoi(chapterNumber) != chapter) continue;
+
+            for (const tinyxml2::XMLElement* v = c->FirstChildElement(); v; v = v->NextSiblingElement()) {
+                const char* verseNumber = v->Attribute("n");
+                if (!verseNumber) continue;
+                const int number = std::atoi(verseNumber);
+                if (number < startVerse || number > endVerse) continue;
+                const char* text = v->GetText();
+                if (text) verses.push_back(Squeeze(text));
+            }
+            return verses;
+        }
+        return verses;
+    }
+    return verses;
+}
+
+struct Span { const char* book; int chapter; int startVerse; int endVerse; };
+
+static void CheckSpanComplete(const std::string& kjv, const std::string& reference,
+                              const std::vector<Span>& spans, const std::string& note) {
+    auto r = Retrieve(reference, kjv);
+    CHECK(r.ok, reference + " should resolve" + note);
+    if (!r.ok) return;
+
+    const std::string actual = Squeeze(r.verseText);
+
+    size_t expectedCount = 0;
+    size_t missing = 0;
+    std::string firstMissing;
+
+    for (const auto& span : spans) {
+        const auto verses = OracleVerses(kjv, span.book, span.chapter, span.startVerse, span.endVerse);
+        CHECK(!verses.empty(), reference + ": oracle found no verses for " +
+              std::string(span.book) + " " + std::to_string(span.chapter));
+        expectedCount += verses.size();
+        for (const auto& verse : verses) {
+            if (verse.empty()) continue;
+            if (actual.find(verse) == std::string::npos) {
+                ++missing;
+                if (firstMissing.empty()) firstMissing = verse.substr(0, 60);
+            }
+        }
+    }
+
+    CHECK(missing == 0, reference + note + ": " + std::to_string(missing) + " of " +
+          std::to_string(expectedCount) + " verses missing from the result" +
+          (firstMissing.empty() ? "" : "; first missing: \"" + firstMissing + "...\""));
+}
+
+static void TestRangeCompleteness() {
+    BeginSection("Range completeness (every verse in the span)");
+    const std::string kjv = "Bibles/KJV.xml";
+
+    // Verified against the XML itself, under each formatting combination that
+    // changes how verses are joined - including dynamicReference, which is where
+    // ranges were reported as broken.
+    struct Combo {
+        const char* name;
+        bool includeVerseNumbers;
+        bool dynamicReference;
+        bool newLineBetweenChapters;
+    };
+    const Combo combos[] = {
+        { "defaults",                      false, false, false },
+        { "verseNumbers",                  true,  false, false },
+        { "dynamicReference+verseNumbers", true,  true,  false },
+        { "dynamicReference only",         false, true,  false },
+        { "newlineBetweenChapters",        true,  false, true  },
+    };
+
+    auto& config = ConfigManager::getInstance();
+    const VerseLinkConfig saved = config.getConfig();
+
+    for (const auto& combo : combos) {
+        config.setIncludeVerseNumbers(combo.includeVerseNumbers);
+        config.setDynamicReference(combo.dynamicReference);
+        config.setNewLineBetweenChapters(combo.newLineBetweenChapters);
+        const std::string note = std::string(" [") + combo.name + "]";
+
+        CheckSpanComplete(kjv, "Romans 8:1-5",    {{"Romans", 8, 1, 5}}, note);
+        CheckSpanComplete(kjv, "Psalm 23:1-6",    {{"Psalms", 23, 1, 6}}, note);
+        CheckSpanComplete(kjv, "Psalm 23",        {{"Psalms", 23, 1, 999}}, note);
+        CheckSpanComplete(kjv, "Genesis 1",       {{"Genesis", 1, 1, 999}}, note);
+        CheckSpanComplete(kjv, "John 3:16",       {{"John", 3, 16, 16}}, note);
+        CheckSpanComplete(kjv, "Romans 8:28-9:1", {{"Romans", 8, 28, 999}, {"Romans", 9, 1, 1}}, note);
+        CheckSpanComplete(kjv, "John 1-2",        {{"John", 1, 1, 999}, {"John", 2, 1, 999}}, note);
+
+        // Upper bound: the verse just past the end must not leak in.
+        {
+            auto r = Retrieve("Romans 8:1-5", kjv);
+            const auto beyond = OracleVerses(kjv, "Romans", 8, 6, 6);
+            CHECK(r.ok && beyond.size() == 1 &&
+                  Squeeze(r.verseText).find(beyond[0]) == std::string::npos,
+                  "Romans 8:1-5" + note + " must not include verse 6");
+        }
+    }
+
+    // Restore
+    config.setIncludeVerseNumbers(saved.includeVerseNumbers);
+    config.setDynamicReference(saved.dynamicReference);
+    config.setNewLineBetweenChapters(saved.newLineBetweenChapters);
+}
+
+// ---------------------------------------------------------------------------
+// Replacement composition and the settings that drive it
+// ---------------------------------------------------------------------------
+
+static void TestReplacementComposition() {
+    BeginSection("Replacement composition");
+
+    const std::string reference = "John 3:16";
+    const std::string verse = "For God so loved the world";
+
+    VerseLinkConfig config;
+    config.includeReferenceInReplacement = true;
+    config.referenceOnFirstLine = false;
+    config.replacementFormat = "{reference} {text}";
+    CHECK(VerseFormatter::ComposeReplacementText(config, reference, verse) ==
+          reference + " " + verse, "default template puts reference before text");
+
+    // Regression: this used to do the opposite of what it says, because
+    // GetVerseText prepended the reference when the flag was false.
+    config.includeReferenceInReplacement = false;
+    CHECK(VerseFormatter::ComposeReplacementText(config, reference, verse) == verse,
+          "includeReferenceInReplacement=false yields verse text only");
+
+    config.includeReferenceInReplacement = true;
+    config.referenceOnFirstLine = true;
+    CHECK(VerseFormatter::ComposeReplacementText(config, reference, verse) ==
+          reference + "\n" + verse, "referenceOnFirstLine puts the reference on its own line");
+
+    config.referenceOnFirstLine = false;
+    config.replacementFormat = "{text} ({reference})";
+    CHECK(VerseFormatter::ComposeReplacementText(config, reference, verse) ==
+          verse + " (" + reference + ")", "template order is honoured");
+
+    config.replacementFormat = "{reference}: {text} -- {reference}";
+    CHECK(VerseFormatter::ComposeReplacementText(config, reference, verse) ==
+          reference + ": " + verse + " -- " + reference,
+          "every occurrence of a token is replaced, not just the first");
+
+    config.replacementFormat = "no tokens here";
+    CHECK(VerseFormatter::ComposeReplacementText(config, reference, verse) ==
+          reference + " " + verse,
+          "a template naming no token falls back instead of pasting itself");
+
+    config.replacementFormat = "{reference} {text}";
+    CHECK(VerseFormatter::ComposeReplacementText(config, "", verse) == verse,
+          "an empty reference yields verse text only");
+}
+
+static void TestNoFalseSuccess() {
+    BeginSection("Unresolvable references never report success");
+    const std::string kjv = "Bibles/KJV.xml";
+
+    // A reference whose book resolves but whose chapter or verse does not used
+    // to come back "successful" carrying only the reference, which the app then
+    // pasted over the user's selection.
+    const char* unresolvable[] = {
+        "Genesis 999", "John 3:999", "Romans 8:900-905", "Psalm 23:40-45", "Continue with Phase 5"
+    };
+
+    auto& config = ConfigManager::getInstance();
+    const VerseLinkConfig saved = config.getConfig();
+
+    const bool referenceFlags[] = { true, false };
+    for (bool includeReference : referenceFlags) {
+        for (bool firstLine : referenceFlags) {
+            config.setIncludeReferenceInReplacement(includeReference);
+            config.setReferenceOnFirstLine(firstLine);
+            const std::string note = std::string(" [includeReference=") +
+                (includeReference ? "true" : "false") + ", firstLine=" +
+                (firstLine ? "true" : "false") + "]";
+
+            for (const char* input : unresolvable) {
+                auto r = Retrieve(input, kjv);
+                CHECK(!r.ok, std::string(input) + note + " must not report success");
+                CHECK(r.verseText.empty(), std::string(input) + note + " must produce no verse text");
+            }
+        }
+    }
+
+    config.setIncludeReferenceInReplacement(saved.includeReferenceInReplacement);
+    config.setReferenceOnFirstLine(saved.referenceOnFirstLine);
+}
+
+// ---------------------------------------------------------------------------
+// Book aliases
+// ---------------------------------------------------------------------------
+
+static void TestBookAliases() {
+    BeginSection("Book aliases");
+
+    // Every alias must resolve to a name the XML actually uses; values like
+    // "1st John" or "I Corinthians" parsed fine and then found no book.
+    const struct { const char* input; const char* expected; } aliases[] = {
+        { "1st John 1:9",       "1 John" },
+        { "2nd John 1",         "2 John" },
+        { "3rd John 1",         "3 John" },
+        { "I Corinthians 13:4", "1 Corinthians" },
+        { "II Corinthians 5:17","2 Corinthians" },
+        { "I Timothy 1:1",      "1 Timothy" },
+        { "II Timothy 2:1",     "2 Timothy" },
+        { "I Thessalonians 5:16","1 Thessalonians" },
+        { "II Thessalonians 3:3","2 Thessalonians" },
+        { "jud 1:1",            "Judges" },   // "jud" is Judges; Jude keeps jude/jd
+        { "jude 1",             "Jude" },
+        { "jd 1",               "Jude" },
+        // Multi-word names: the book capture group used to stop at the first
+        // word, so these could not parse whatever the alias table said.
+        { "Song of Solomon 2:1","Song of Solomon" },
+        { "Song of Songs 2:1",  "Song of Solomon" },
+        { "1 Samuel 2:3",       "1 Samuel" },
+        { "2 Chronicles 7:14",  "2 Chronicles" },
+    };
+
+    for (const auto& alias : aliases) {
+        auto refs = Parse(alias.input);
+        CHECK(refs.size() == 1, std::string(alias.input) + " should parse");
+        if (refs.size() != 1) continue;
+        CHECK(refs[0].BookName == alias.expected,
+              std::string(alias.input) + " should resolve to " + alias.expected +
+              ", got '" + refs[0].BookName + "'");
+    }
+
+    // Invariant: every alias resolves to a canonical book, so no alias can parse
+    // and then fail the XML lookup.
+    const auto canonical = Bible::GetBookNames();
+    for (const auto& entry : Bible::BookAliases) {
+        const bool known = std::find(canonical.begin(), canonical.end(), entry.second) != canonical.end();
+        CHECK(known, "alias '" + entry.first + "' maps to '" + entry.second +
+                     "', which is not a canonical book name");
+        std::string lowered = entry.first;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        CHECK(entry.first == lowered,
+              "alias key '" + entry.first + "' is unreachable: lookups are lowercased first");
+
+        // And it must actually resolve through the public entry point.
+        CHECK(Bible::NormalizeBookName(entry.first) == entry.second,
+              "alias '" + entry.first + "' should normalise to '" + entry.second +
+              "', got '" + Bible::NormalizeBookName(entry.first) + "'");
+    }
+
+    // Aliases must actually retrieve, not merely parse.
+    auto r = Retrieve("1st John 1:9", "Bibles/KJV.xml");
+    CHECK(r.ok && r.verseText.find("faithful and just") != std::string::npos,
+          "1st John 1:9 retrieves real verse text");
+}
+
+// ---------------------------------------------------------------------------
+// Threading
+// ---------------------------------------------------------------------------
+
+static void TestTaskQueue() {
+    BeginSection("Task queue hand-off");
+
+    // Lost-wakeup regression. The pending flag has to be set under the same
+    // mutex the waiter blocks on; setting it outside let a notify slip between
+    // the waiter's predicate check and its registration on the condition
+    // variable. The wakeup was lost, the flag stayed set, and every later press
+    // was then coalesced away - the app went permanently deaf to the hotkey.
+    TaskQueue queue;
+    std::atomic<int> handled(0);
+
+    std::thread worker([&] {
+        while (queue.WaitForTask()) {
+            ++handled;
+        }
+    });
+
+    int posted = 0;
+    for (int i = 0; i < 5000; ++i) {
+        if (queue.Post()) ++posted;
+    }
+
+    // Wait for the worker to drain, with a bound so a lost wakeup fails the test
+    // instead of hanging CI.
+    const int timeoutMs = 5000;
+    int waitedMs = 0;
+    while (handled < posted && waitedMs < timeoutMs) {
+        Sleep(10);
+        waitedMs += 10;
+    }
+
+    CHECK(handled == posted, "every queued task was handled (posted=" +
+          std::to_string(posted) + ", handled=" + std::to_string(handled.load()) +
+          ") - a shortfall means a wakeup was lost");
+    CHECK(posted > 0, "the queue actually accepted work");
+
+    queue.Shutdown();
+    worker.join();
+
+    CHECK(queue.IsShuttingDown(), "queue reports shutdown");
+    CHECK(!queue.Post(), "Post() is refused after shutdown");
+    CHECK(!queue.WaitForTask(), "WaitForTask() returns false after shutdown");
+
+    // Coalescing: a second post while one is pending must not queue extra work.
+    TaskQueue coalescing;
+    CHECK(coalescing.Post(), "first post is accepted");
+    CHECK(!coalescing.Post(), "second post is coalesced into the pending one");
+    CHECK(coalescing.WaitForTask(), "the pending task is delivered once");
+    coalescing.Shutdown();
+}
+
+static void TestLoggerConcurrency() {
+    BeginSection("Logger reconfiguration under load");
+
+    // Logger::initialize runs on the UI thread whenever settings are saved,
+    // while the worker thread may be inside log() writing to the same ofstream.
+    // Without a shared lock that is a data race on a live stream.
+    const std::string pathA = "tests/logger_race.log";
+    const std::string pathB = "tests/logger_race_b.log";
+    for (const auto& path : { pathA, pathB }) {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    }
+
+    Logger::initialize(pathA, Info, /*console*/ false, /*file*/ true);
+
+    std::atomic<bool> stop(false);
+    std::atomic<long long> writes(0), reconfigures(0);
+
+    std::thread logger([&] {
+        while (!stop) {
+            LOG_INFO("concurrent logging line that is long enough to matter");
+            ++writes;
+        }
+    });
+
+    std::thread reconfigurer([&] {
+        bool toggle = false;
+        while (!stop) {
+            Logger::initialize(toggle ? pathB : pathA, Info, false, true);
+            toggle = !toggle;
+            ++reconfigures;
+        }
+    });
+
+    Sleep(750);
+    stop = true;
+    logger.join();
+    reconfigurer.join();
+
+    Logger::initialize(pathA, Info, false, true);
+    CHECK(writes > 10 && reconfigures > 10,
+          "logger race actually exercised both threads (writes=" + std::to_string(writes) +
+          ", reconfigures=" + std::to_string(reconfigures) + ")");
+
+    // Interleaved writes must still produce whole, well-formed lines.
+    size_t lines = 0, malformed = 0;
+    for (const auto& path : { pathA, pathB }) {
+        std::ifstream file(path);
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.empty()) continue;
+            ++lines;
+            if (line.front() != '[') ++malformed;
+        }
+    }
+    CHECK(lines > 0, "log lines were written");
+    CHECK(malformed == 0, "no torn log lines (" + std::to_string(malformed) + " of " +
+          std::to_string(lines) + " malformed)");
+
+    Logger::initialize("verselink.log", Info, true, true);
+}
+
 int main() {
     TestParsing();
+    TestDashVariants();
+    TestBookAliases();
     TestRetrieval();
+    TestRangeCompleteness();
+    TestReplacementComposition();
+    TestNoFalseSuccess();
     TestUnicodeHelpers();
     TestBibleVersionDiscovery();
     TestNonReferenceInput();
+    TestTaskQueue();
+    TestLoggerConcurrency();
     TestConfigRoundTrip();
     TestConfigConcurrency();
     TestLogRotation();

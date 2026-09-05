@@ -77,6 +77,7 @@
       <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -92,6 +93,7 @@
       <PreprocessorDefinitions>WIN32;NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -108,6 +110,7 @@
       <ConformanceMode>true</ConformanceMode>
       <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -126,6 +129,7 @@
       <ConformanceMode>true</ConformanceMode>
       <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -141,10 +145,13 @@
     <ClCompile Include="ClipboardInterface.cpp" />
     <ClCompile Include="ConfigManager.cpp" />
     <ClCompile Include="Logger.cpp" />
+    <ClCompile Include="SelfTest.cpp" />
     <ClCompile Include="SettingsDialog.cpp" />
     <ClCompile Include="StringExtensions.cpp" />
     <ClCompile Include="SystemTray.cpp" />
+    <ClCompile Include="TaskQueue.cpp" />
     <ClCompile Include="tinyxml2.cpp" />
+    <ClCompile Include="VerseFormatter.cpp" />
     <ClCompile Include="VerseLinkWindows.cpp" />
     <ClCompile Include="VerseRetrieveInterface.cpp" />
   </ItemGroup>
@@ -153,10 +160,13 @@
     <ClInclude Include="ClipboardInterface.h" />
     <ClInclude Include="ConfigManager.h" />
     <ClInclude Include="Logger.h" />
+    <ClInclude Include="SelfTest.h" />
     <ClInclude Include="SettingsDialog.h" />
     <ClInclude Include="StringExtensions.h" />
     <ClInclude Include="SystemTray.h" />
+    <ClInclude Include="TaskQueue.h" />
     <ClInclude Include="tinyxml2.h" />
+    <ClInclude Include="VerseFormatter.h" />
     <ClInclude Include="VerseLinkWindows.h" />
     <ClInclude Include="VerseRetrieveInterface.h" />
   </ItemGroup>

@@ -276,42 +276,50 @@ std::string ClipboardInterface::GetSelectedTextFromEditControl() {
         return "";
     }
     
-    // Try to get selection from standard edit control
-    DWORD start, end;
-    LRESULT selResult = SendMessage(m_target_window, EM_GETSEL, 
-                                   reinterpret_cast<WPARAM>(&start), 
-                                   reinterpret_cast<LPARAM>(&end));
-    
-    if (selResult == -1) {
-        LogError("Not a standard edit control");
+    // EM_GETSEL only means something to an edit control. Sent to any other
+    // window it reaches DefWindowProc, which returns 0 - not the -1 this used to
+    // check for - and never writes through the pointers, so start/end stayed
+    // uninitialised and whatever was on the stack got used as a selection range.
+    wchar_t className[64] = {};
+    GetClassNameW(m_target_window, className, ARRAYSIZE(className));
+    if (_wcsicmp(className, L"Edit") != 0 && _wcsnicmp(className, L"RichEdit", 8) != 0) {
+        LogError("Target window is not an edit control (class: " +
+                 StringExtensions::WideToUtf8(className) + ")");
         return "";
     }
-    
-    int length = end - start;
-    if (length <= 0) {
+
+    DWORD start = 0;
+    DWORD end = 0;
+    SendMessageW(m_target_window, EM_GETSEL,
+                 reinterpret_cast<WPARAM>(&start),
+                 reinterpret_cast<LPARAM>(&end));
+
+    if (end <= start) {
         LogError("No text selected in edit control");
         return "";
     }
-    
-    // Get the full text first
-    int textLength = GetWindowTextLengthA(m_target_window);
-    if (textLength == 0) {
+
+    // Read and index the text as wide characters. EM_GETSEL offsets count
+    // characters, so slicing UTF-8 bytes at those offsets splits multi-byte
+    // characters; the old GetWindowTextA path also handed back raw ANSI bytes
+    // that everything downstream then treated as UTF-8.
+    const int textLength = GetWindowTextLengthW(m_target_window);
+    if (textLength <= 0) {
         LogError("Edit control has no text");
         return "";
     }
-    
-    std::vector<char> buffer(textLength + 1);
-    GetWindowTextA(m_target_window, buffer.data(), textLength + 1);
-    
-    std::string fullText(buffer.data());
-    if (start < fullText.length() && end <= fullText.length()) {
-        std::string selectedText = fullText.substr(start, length);
-        Log += "Edit Control: Successfully retrieved selected text\n";
-        return selectedText;
+
+    std::wstring buffer(static_cast<size_t>(textLength) + 1, L'\0');
+    const int copied = GetWindowTextW(m_target_window, &buffer[0], textLength + 1);
+    buffer.resize(copied > 0 ? static_cast<size_t>(copied) : 0);
+
+    if (start >= buffer.size() || end > buffer.size()) {
+        LogError("Invalid selection range in edit control");
+        return "";
     }
-    
-    LogError("Invalid selection range in edit control");
-    return "";
+
+    Log += "Edit Control: Successfully retrieved selected text\n";
+    return StringExtensions::WideToUtf8(buffer.substr(start, end - start));
 }
 
 bool ClipboardInterface::SendKeys(const std::vector<WORD>& keys) {
@@ -537,41 +545,51 @@ bool ClipboardInterface::ReplaceSelectedText(const std::string& newText) {
         // Try sending individual key events with more delay
         Sleep(100);
         
+        // Every SendInput result is counted. Hardcoding success here meant a
+        // paste that was never delivered still reported "Successfully replaced
+        // selected text" while the user's selection sat untouched.
+        UINT delivered = 0;
+
         // Send Ctrl down
         INPUT ctrlDown = {};
         ctrlDown.type = INPUT_KEYBOARD;
         ctrlDown.ki.wVk = VK_CONTROL;
-        SendInput(1, &ctrlDown, sizeof(INPUT));
-        
+        delivered += SendInput(1, &ctrlDown, sizeof(INPUT));
+
         Sleep(50);
-        
+
         // Send V down
         INPUT vDown = {};
         vDown.type = INPUT_KEYBOARD;
         vDown.ki.wVk = 'V';
-        SendInput(1, &vDown, sizeof(INPUT));
-        
+        delivered += SendInput(1, &vDown, sizeof(INPUT));
+
         Sleep(50);
-        
+
         // Send V up
         INPUT vUp = {};
         vUp.type = INPUT_KEYBOARD;
         vUp.ki.wVk = 'V';
         vUp.ki.dwFlags = KEYEVENTF_KEYUP;
-        SendInput(1, &vUp, sizeof(INPUT));
-        
+        delivered += SendInput(1, &vUp, sizeof(INPUT));
+
         Sleep(50);
-        
+
         // Send Ctrl up
         INPUT ctrlUp = {};
         ctrlUp.type = INPUT_KEYBOARD;
         ctrlUp.ki.wVk = VK_CONTROL;
         ctrlUp.ki.dwFlags = KEYEVENTF_KEYUP;
-        SendInput(1, &ctrlUp, sizeof(INPUT));
-        
-        Log += "ReplaceSelectedText: Sent manual Ctrl+V sequence\n";
+        delivered += SendInput(1, &ctrlUp, sizeof(INPUT));
+
+        success = (delivered == 4);
+        if (success) {
+            Log += "ReplaceSelectedText: Sent manual Ctrl+V sequence\n";
+        } else {
+            LogError("Manual Ctrl+V sequence was only partially delivered (" +
+                     std::to_string(delivered) + "/4 inputs)");
+        }
         Sleep(500);
-        success = true;
     }
     
     // Give the paste time to complete before restoring the original clipboard.

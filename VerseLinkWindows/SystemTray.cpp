@@ -3,6 +3,7 @@
 #include "Logger.h"
 #include "SettingsDialog.h"
 #include "StringExtensions.h"
+#include "VerseLinkWindows.h" // DescribeHotkey
 #include <fstream>
 #include <sstream>
 #include <commctrl.h>
@@ -137,8 +138,17 @@ void SystemTray::HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
 }
 
 void SystemTray::ShowSettingsDialog() {
+    // The open dialog's modal loop still dispatches tray messages, so this can
+    // be re-entered while one is up. Stacking a second dialog left the first
+    // one's Save silently doing nothing.
+    if (SettingsDialog::IsOpen()) {
+        LogMessage("Settings dialog already open; bringing it to the front");
+        SettingsDialog::FocusExisting();
+        return;
+    }
+
     LogMessage("Opening settings dialog");
-    
+
     try {
         SettingsDialog settingsDialog(hwnd);
         settingsDialog.Show();
@@ -153,16 +163,25 @@ void SystemTray::ShowSettingsDialog() {
 }
 
 void SystemTray::ShowAboutDialog() {
-    std::wstring aboutText = 
+    // Read the hotkey from config rather than hardcoding it, so this cannot
+    // disagree with what actually triggers a lookup.
+    const VerseLinkConfig config = ConfigManager::getInstance().getConfig();
+    const std::wstring hotkey = StringExtensions::Utf8ToWide(
+        DescribeHotkey(config.hotkeyModifiers, config.hotkeyVirtualKey));
+
+    // \u2022 is a bullet. Spelled as an escape because this file must stay
+    // ASCII-only; literal Unicode here has been corrupted by a bad round-trip
+    // before, and CI now rejects non-ASCII bytes in sources.
+    const std::wstring aboutText =
         L"VerseLink v1.0\n\n"
         L"A Bible verse lookup and insertion tool.\n\n"
         L"Features:\n"
-        L"• Hotkey-activated verse lookup (Ctrl+Alt+L)\n"
-        L"• Support for single verses, ranges, chapters, and books\n"
-        L"• Smart text selection with clipboard preservation\n"
-        L"• Configurable Bible versions and formatting\n\n"
+        L"\u2022 Hotkey-activated verse lookup (" + hotkey + L")\n"
+        L"\u2022 Support for single verses, ranges, chapters, and books\n"
+        L"\u2022 Smart text selection with clipboard preservation\n"
+        L"\u2022 Configurable Bible versions and formatting\n\n"
         L"Created with C++ and Win32 API";
-    
+
     MessageBox(hwnd, aboutText.c_str(), L"About VerseLink", MB_OK | MB_ICONINFORMATION);
     LogMessage("About dialog displayed");
 }

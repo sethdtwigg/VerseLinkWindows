@@ -142,6 +142,11 @@ The application can parse various Bible reference formats:
 - `Romans 8:28-9:1` (cross-chapter)
 - `Genesis - Exodus` (book range)
 
+Any dash works, not just the ASCII hyphen. References pasted from Word, Outlook
+or a web page usually carry an en dash (`Romans 8:1–5`); en dashes, em dashes,
+non-breaking hyphens, minus signs and non-breaking spaces are all folded to
+their ASCII equivalents before parsing.
+
 ### Multiple Verses
 - `John 3:16,18,20`
 - `1 Peter 1:3,5,7`
@@ -156,6 +161,20 @@ The application can parse various Bible reference formats:
 - Short abbreviations: `gen`, `exo`, `jn`
 - Medium abbreviations: `genesis`, `exodus`, `john`
 - Numbered books: `1 samuel`, `2 cor`, `1 john`
+- Roman and ordinal forms: `I Corinthians`, `II Timothy`, `1st John`, `3rd John`
+- Multi-word names: `Song of Solomon`, `Song of Songs`
+
+## Command Line
+
+Running the exe with no arguments starts it in the system tray, as usual. Two
+flags are available for diagnosis and CI:
+
+| Flag | What it does |
+|---|---|
+| `--selftest` | Runs the headless end-to-end checks (lookup + formatting, every setting combination) and exits non-zero on failure. Needs `Bibles/` reachable from the working directory or next to the exe. |
+| `--verse "<reference>"` | Prints the replacement text a reference would produce, without the hotkey or the clipboard. Useful for reproducing a report: `VerseLinkWindows.exe --verse "Romans 8:1-5"` |
+
+Neither flag writes to `config.json` or starts the tray icon.
 
 ## Bible Data Files
 

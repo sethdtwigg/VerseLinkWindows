@@ -6,6 +6,14 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Packaging changes are built (never published) on their own pull requests, so
+  # a broken .iss or script is caught before it can break a real release. The
+  # publish step below is gated on a tag, so these runs only produce artifacts.
+  pull_request:
+    paths:
+      - "packaging/**"
+      - ".github/workflows/release.yml"
+      - "VerseLinkWindows/Version.h"
   workflow_dispatch:
     inputs:
       publish:

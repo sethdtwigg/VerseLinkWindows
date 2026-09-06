@@ -24,6 +24,13 @@ Logger& Logger::getInstance() {
 void Logger::initialize(const std::string& path, LogLevel level, bool console, bool file,
                         size_t fileSizeLimit, int backupCount) {
     auto& logger = getInstance();
+
+    // Under logMutex: this runs on the UI thread whenever settings are saved,
+    // while the verse worker thread may be inside log() writing to logFile.
+    // Closing and reopening that stream unsynchronised is a data race on a live
+    // ofstream, not merely a torn setting.
+    std::lock_guard<std::mutex> lock(logger.logMutex);
+
     logger.currentLogLevel = level;
     logger.consoleOutput = console;
     logger.fileOutput = file;
@@ -116,12 +123,13 @@ std::string Logger::levelToString(LogLevel level) {
 }
 
 void Logger::log(LogLevel level, const std::string& message) {
+    std::lock_guard<std::mutex> lock(logMutex);
+
+    // Checked under the lock: initialize() can change the level concurrently.
     if (level < currentLogLevel) {
         return;
     }
-    
-    std::lock_guard<std::mutex> lock(logMutex);
-    
+
     RotateIfNeeded();
     
     std::string timestamp = getCurrentTimestamp();
@@ -158,15 +166,19 @@ void Logger::error(const std::string& message) {
     log(LogLevel::Error, message);
 }
 
+// All three share logMutex with log(), for the same reason initialize() does.
 void Logger::setLogLevel(LogLevel level) {
+    std::lock_guard<std::mutex> lock(logMutex);
     currentLogLevel = level;
 }
 
 void Logger::enableConsoleOutput(bool enable) {
+    std::lock_guard<std::mutex> lock(logMutex);
     consoleOutput = enable;
 }
 
 void Logger::enableFileOutput(bool enable) {
+    std::lock_guard<std::mutex> lock(logMutex);
     fileOutput = enable;
 }
 

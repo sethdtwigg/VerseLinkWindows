@@ -1,9 +1,14 @@
-﻿#include "VerseLinkWindows.h"
+#include "VerseLinkWindows.h"
 #include "Logger.h"
 #include "ConfigManager.h"
+#include "TaskQueue.h"
+#include "VerseFormatter.h"
+#include "SelfTest.h"
+#include "StringExtensions.h"
 #include <mutex>
 #include <atomic>
-#include <condition_variable>
+#include <vector>
+#include <shellapi.h>
 
 // Global variable definitions
 std::atomic<bool> Logging{false};
@@ -34,111 +39,158 @@ void QueueHotkeyTask() {
 // A single persistent worker thread executes verse tasks; the UI thread only
 // queues work and is never blocked by clipboard/UIA sleeps.
 static std::thread g_workerThread;
-static std::mutex g_taskMutex;
-static std::condition_variable g_taskCV;
+static TaskQueue g_taskQueue;
 static std::atomic<bool> g_shouldExit(false);
-static std::atomic<bool> g_taskPending(false);
 static DWORD g_mainThreadId = 0;
+static HWND g_mainWindow = nullptr;
 
 // Hotkey registration state (for live re-registration when settings change)
+static bool g_hotkeyRegistered = false;
 static int g_registeredModifiers = 0;
 static int g_registeredVirtualKey = 0;
 
-static void Log(const std::string& message) {
-    if (Logging) {
-        LOG_INFO(message);
+std::string DescribeHotkey(int modifiers, int virtualKey) {
+    std::string description;
+    if (modifiers & MOD_CONTROL) description += "Ctrl+";
+    if (modifiers & MOD_ALT)     description += "Alt+";
+    if (modifiers & MOD_SHIFT)   description += "Shift+";
+    if (modifiers & MOD_WIN)     description += "Win+";
+
+    const UINT mapped = MapVirtualKeyW(static_cast<UINT>(virtualKey), MAPVK_VK_TO_CHAR) & 0x7FFF;
+    if (mapped >= 0x20 && mapped < 0x7F) {
+        description += static_cast<char>(mapped);
+    } else {
+        description += "VK" + std::to_string(virtualKey);
     }
+    return description;
 }
 
+// Registers the hotkey, never at the cost of the one already working.
+//
+// RegisterHotKey is the only way to discover whether another application owns a
+// combination, so the new one is probed under a scratch id first. Releasing the
+// current registration up front (as this used to) meant a failed change left the
+// app with no hotkey at all while logging that it had kept the old one.
 static bool RegisterAppHotkey(int modifiers, int virtualKey) {
-    UnregisterHotKey(nullptr, MY_HOTKEY_ID);
-    // MOD_NOREPEAT suppresses auto-repeat when the combo is held down.
-    if (!RegisterHotKey(nullptr, MY_HOTKEY_ID, modifiers | MOD_NOREPEAT, virtualKey)) {
-        LOG_ERROR("Failed to register hotkey (modifiers=" + std::to_string(modifiers) +
+    const UINT flags = static_cast<UINT>(modifiers) | MOD_NOREPEAT;
+
+    if (g_hotkeyRegistered &&
+        modifiers == g_registeredModifiers &&
+        virtualKey == g_registeredVirtualKey) {
+        return true; // already registered to us
+    }
+
+    if (!RegisterHotKey(nullptr, PROBE_HOTKEY_ID, flags, virtualKey)) {
+        LOG_ERROR("Failed to register hotkey " + DescribeHotkey(modifiers, virtualKey) +
+                  " (modifiers=" + std::to_string(modifiers) +
                   ", virtualKey=" + std::to_string(virtualKey) +
                   "). It may be in use by another application.");
-        g_registeredModifiers = 0;
-        g_registeredVirtualKey = 0;
         return false;
     }
-    g_registeredModifiers = modifiers;
-    g_registeredVirtualKey = virtualKey;
-    return true;
+    UnregisterHotKey(nullptr, PROBE_HOTKEY_ID);
+
+    const bool hadHotkey = g_hotkeyRegistered;
+    const int previousModifiers = g_registeredModifiers;
+    const int previousVirtualKey = g_registeredVirtualKey;
+
+    if (hadHotkey) {
+        UnregisterHotKey(nullptr, MY_HOTKEY_ID);
+        g_hotkeyRegistered = false;
+    }
+
+    if (RegisterHotKey(nullptr, MY_HOTKEY_ID, flags, virtualKey)) {
+        g_hotkeyRegistered = true;
+        g_registeredModifiers = modifiers;
+        g_registeredVirtualKey = virtualKey;
+        return true;
+    }
+
+    LOG_ERROR("Failed to register hotkey " + DescribeHotkey(modifiers, virtualKey) +
+              " after releasing the previous one");
+
+    if (hadHotkey && RegisterHotKey(nullptr, MY_HOTKEY_ID,
+                                    static_cast<UINT>(previousModifiers) | MOD_NOREPEAT,
+                                    previousVirtualKey)) {
+        g_hotkeyRegistered = true;
+        g_registeredModifiers = previousModifiers;
+        g_registeredVirtualKey = previousVirtualKey;
+        LOG_WARNING("Restored the previously registered hotkey " +
+                    DescribeHotkey(previousModifiers, previousVirtualKey));
+    } else {
+        g_registeredModifiers = 0;
+        g_registeredVirtualKey = 0;
+    }
+    return false;
+}
+
+static void UpdateTrayTooltip() {
+    if (!g_mainWindow) return;
+    SystemTray* systemTray = reinterpret_cast<SystemTray*>(GetWindowLongPtr(g_mainWindow, GWLP_USERDATA));
+    if (!systemTray) return;
+
+    if (g_hotkeyRegistered) {
+        systemTray->UpdateTooltip("VerseLink - Press " +
+                                  DescribeHotkey(g_registeredModifiers, g_registeredVirtualKey) +
+                                  " to insert verse");
+    } else {
+        systemTray->UpdateTooltip("VerseLink - no hotkey registered");
+    }
 }
 
 // Settings update callback
 void OnSettingsChanged() {
-    const auto& config = ConfigManager::getInstance().getConfig();
-    
+    const VerseLinkConfig config = ConfigManager::getInstance().getConfig();
+
     // Update global variables from config
     SetBibleVersionSetting(config.bibleVersion);
     Logging = config.enableLogging;
     Debugging = config.debugMode;
-    
+
     // Re-register the hotkey if it changed
-    if ((g_registeredModifiers != config.hotkeyModifiers ||
-         g_registeredVirtualKey != config.hotkeyVirtualKey) &&
-        !RegisterAppHotkey(config.hotkeyModifiers, config.hotkeyVirtualKey)) {
-        LOG_WARNING("Keeping previously registered hotkey");
+    if (!RegisterAppHotkey(config.hotkeyModifiers, config.hotkeyVirtualKey)) {
+        LOG_WARNING("Hotkey unchanged; the requested combination could not be registered");
     }
+    UpdateTrayTooltip();
 
     // Apply logger changes (level/outputs); reopen file if its path changed
     Logger::initialize(config.logFilePath,
                        static_cast<LogLevel>(config.logLevel),
                        config.enableConsoleLogging, config.enableFileLogging);
-    
+
     LOG_INFO("Settings updated - Bible version: " + config.bibleVersion + ", Logging: " + (Logging ? "enabled" : "disabled") + ", Debug: " + (Debugging ? "enabled" : "disabled"));
 }
 
 void VerseLinkTask() {
     try {
         LOG_INFO("Starting VerseLink task");
-        
+
         // Snapshot settings so a concurrent settings change cannot tear values
         // mid-task. getConfig() returns an atomic copy.
         const VerseLinkConfig config = ConfigManager::getInstance().getConfig();
         std::string bibleVersion = GetBibleVersionSetting();
-        
+
         // Get selected text
         ClipboardInterface ci;
         std::string selectedText = ci.GetSelectedText();
-        
+
         LOG_INFO("Selected text: '" + selectedText + "'");
         LOG_INFO("ClipboardInterface log:\n" + ci.GetLog());
-        
+
         if (!selectedText.empty()) {
             // Retrieve verse
             LOG_INFO("Creating VerseRetrieveInterface with: '" + selectedText + "' and version: '" + bibleVersion + "'");
             std::unique_ptr<VerseRetrieveInterface> vri(new VerseRetrieveInterface(selectedText, bibleVersion));
             LOG_INFO("VerseRetrieveInterface created. Log:\n" + vri->GetLog());
-            
+
             if (vri->GetVerseText()) {
                 LOG_INFO("Successfully retrieved verse text");
 
-                std::string reference = vri->ReferenceText.empty() ? selectedText : vri->ReferenceText;
-                std::string text = vri->VerseText;
+                const std::string reference = vri->ReferenceText.empty() ? selectedText : vri->ReferenceText;
+                const std::string replacementText =
+                    VerseFormatter::ComposeReplacementText(config, reference, vri->VerseText);
 
-                std::string replacementText = config.replacementFormat;
-                size_t pos = replacementText.find("{reference}");
-                if (pos != std::string::npos) {
-                    replacementText.replace(pos, std::string("{reference}").size(), reference);
-                }
-                pos = replacementText.find("{text}");
-                if (pos != std::string::npos) {
-                    replacementText.replace(pos, std::string("{text}").size(), text);
-                }
-
-                if (!config.includeReferenceInReplacement) {
-                    replacementText = text;
-                } else if (config.referenceOnFirstLine && !reference.empty()) {
-                    if (!text.empty() && text.front() == '\n') {
-                        replacementText = reference + text;
-                    } else {
-                        replacementText = reference + "\n" + text;
-                    }
-                }
                 LOG_INFO("Replacement text: '" + replacementText + "'");
-                
+
                 if (ci.ReplaceSelectedText(replacementText)) {
                     LOG_INFO("Successfully replaced selected text");
                 } else {
@@ -160,39 +212,40 @@ void VerseLinkTask() {
     catch (...) {
         LOG_ERROR("Unknown exception in VerseLinkTask");
     }
-    
+
     LOG_INFO("VerseLink task completed");
 }
 
 // Worker thread body: waits for queued tasks or shutdown.
 static void VerseLinkWorkerProc() {
-    while (true) {
-        std::unique_lock<std::mutex> lock(g_taskMutex);
-        g_taskCV.wait(lock, [] { return g_shouldExit.load() || g_taskPending.load(); });
-        if (g_shouldExit) {
-            break;
-        }
-        g_taskPending = false;
-        lock.unlock();
+    while (g_taskQueue.WaitForTask()) {
         VerseLinkTask();
     }
 }
 
 // Called from the UI thread when the hotkey fires.
 static void QueueVerseLinkTask() {
-    bool alreadyPending = g_taskPending.exchange(true);
-    if (alreadyPending) {
+    if (!g_taskQueue.Post()) {
         LOG_INFO("Task already queued, coalescing hotkey press");
-        return;
     }
-    g_taskCV.notify_one();
+}
+
+// Signals the worker to stop and waits for any in-flight task, so we never exit
+// while it is still touching globals or the clipboard. Safe to call more than
+// once, and every exit path after the thread starts goes through it.
+static void ShutdownWorker() {
+    g_shouldExit = true;
+    g_taskQueue.Shutdown();
+    if (g_workerThread.joinable()) {
+        g_workerThread.join();
+    }
 }
 
 bool RunVerseLink(HWND hwnd, SystemTray* systemTray) {
     try {
         LOG_INFO("Entering message loop");
         MSG msg;
-        
+
         while (!g_shouldExit) {
             int result = GetMessage(&msg, nullptr, 0, 0);
             if (result <= 0) {
@@ -206,11 +259,11 @@ bool RunVerseLink(HWND hwnd, SystemTray* systemTray) {
                 LOG_INFO("Hotkey pressed!");
                 QueueVerseLinkTask();
             }
-            
+
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
-        
+
         LOG_INFO("Exiting message loop");
         return true;
     }
@@ -224,22 +277,22 @@ bool GetConfiguration() {
     try {
         // Initialize configuration manager
         ConfigManager::initialize("config.json");
-        
+
         // Register settings change callback
         ConfigManager::getInstance().setSettingsChangeCallback(OnSettingsChanged);
-        
-        const auto& config = ConfigManager::getInstance().getConfig();
-        
-    // Update global variables from config
-    SetBibleVersionSetting(config.bibleVersion);
-    Logging = config.enableLogging;
-    Debugging = config.debugMode;
-    
-    // Initialize logger with config settings
-    LogLevel logLevel = static_cast<LogLevel>(config.logLevel);
-    Logger::initialize(config.logFilePath, logLevel, 
-                     config.enableConsoleLogging, config.enableFileLogging);
-        
+
+        const VerseLinkConfig config = ConfigManager::getInstance().getConfig();
+
+        // Update global variables from config
+        SetBibleVersionSetting(config.bibleVersion);
+        Logging = config.enableLogging;
+        Debugging = config.debugMode;
+
+        // Initialize logger with config settings
+        LogLevel logLevel = static_cast<LogLevel>(config.logLevel);
+        Logger::initialize(config.logFilePath, logLevel,
+                           config.enableConsoleLogging, config.enableFileLogging);
+
         LOG_INFO("Configuration loaded from config.json");
         return true;
     }
@@ -255,7 +308,7 @@ BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
         ctrlType == CTRL_CLOSE_EVENT) {
         LOG_INFO("Received shutdown signal, exiting gracefully...");
         g_shouldExit = true;
-        g_taskCV.notify_all();
+        g_taskQueue.Shutdown();
         // Wake the main thread's GetMessage() so the message loop can exit.
         PostThreadMessage(g_mainThreadId, WM_QUIT, 0, 0);
         return TRUE;
@@ -267,17 +320,60 @@ BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     // Get system tray instance from window data
     SystemTray* systemTray = reinterpret_cast<SystemTray*>(GetWindowLongPtr(hwnd, GWLP_USERDATA));
-    
+
     if (systemTray && uMsg == WM_TRAYICON) {
         systemTray->HandleMessage(uMsg, wParam, lParam);
         return 0;
     }
-    
+
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
+}
+
+// Arguments as UTF-8, taken from the wide command line rather than main's argv.
+// MSVC hands narrow argv over in the ANSI codepage, so a reference pasted with a
+// real en dash reaches argv as '?' - which is precisely the input --verse exists
+// to reproduce.
+static std::vector<std::string> Utf8CommandLineArgs() {
+    std::vector<std::string> args;
+
+    int wideArgc = 0;
+    LPWSTR* wideArgv = CommandLineToArgvW(GetCommandLineW(), &wideArgc);
+    if (!wideArgv) return args;
+
+    for (int i = 0; i < wideArgc; ++i) {
+        args.push_back(StringExtensions::WideToUtf8(wideArgv[i]));
+    }
+    LocalFree(wideArgv);
+    return args;
 }
 
 int main()
 {
+    // Headless modes run before any window, tray icon, hotkey or worker thread
+    // exists, so CI can exercise the real lookup and formatting path with no GUI.
+    const std::vector<std::string> args = Utf8CommandLineArgs();
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "--selftest") {
+            return SelfTest::Run();
+        }
+        if (args[i] == "--verse") {
+            if (i + 1 >= args.size()) {
+                std::cerr << "--verse requires a reference, e.g. --verse \"Romans 8:1-5\"" << std::endl;
+                return 2;
+            }
+            return SelfTest::PrintVerse(args[i + 1]);
+        }
+        if (args[i] == "--help" || args[i] == "-h") {
+            std::cout << "VerseLink\n"
+                      << "  (no arguments)      run in the system tray\n"
+                      << "  --selftest          run the headless end-to-end checks\n"
+                      << "  --verse <reference> print the replacement text for a reference\n";
+            return 0;
+        }
+        std::cerr << "Unknown argument: " << args[i] << " (try --help)" << std::endl;
+        return 2;
+    }
+
     g_mainThreadId = GetCurrentThreadId();
 
     // Load configuration first (this also initializes the logger)
@@ -285,21 +381,21 @@ int main()
         std::cerr << "Failed to load configuration, exiting..." << std::endl;
         return 1;
     }
-    
+
     // Get configuration for hotkey
-    const auto& config = ConfigManager::getInstance().getConfig();
-    
+    const VerseLinkConfig config = ConfigManager::getInstance().getConfig();
+
     // Create a hidden window for system tray messages
     WNDCLASS wc = {};
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = GetModuleHandle(nullptr);
     wc.lpszClassName = L"VerseLinkHiddenWindow";
-    
+
     if (!RegisterClass(&wc)) {
         LOG_ERROR("Failed to register window class");
         return 1;
     }
-    
+
     HWND hwnd = CreateWindow(
         wc.lpszClassName,
         L"VerseLink",
@@ -309,12 +405,13 @@ int main()
         GetModuleHandle(nullptr),
         nullptr
     );
-    
+
     if (!hwnd) {
         LOG_ERROR("Failed to create window");
         return 1;
     }
-    
+    g_mainWindow = hwnd;
+
     // Initialize system tray
     std::unique_ptr<SystemTray> systemTray(new SystemTray(hwnd));
     if (!systemTray->Initialize()) {
@@ -328,58 +425,55 @@ int main()
         } else {
             LOG_INFO("No custom icon path configured, using default icon");
         }
-        
+
         systemTray->Show();
-        systemTray->UpdateTooltip("VerseLink - Press Ctrl+Alt+L to insert verse");
         LOG_INFO("System tray initialized");
-        
+
         // Store system tray pointer in window data
         SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(systemTray.get()));
     }
-    
+
     // Set up console control handler
     SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
-    
+
     // Hide console if not debugging (must hide before freeing the console,
     // otherwise GetConsoleWindow() returns NULL)
     if (!Debugging) {
         ShowWindow(GetConsoleWindow(), SW_HIDE);
         FreeConsole();
     }
-    
-    // Start the persistent worker thread that executes verse tasks
-    g_workerThread = std::thread(VerseLinkWorkerProc);
-    
+
     LOG_INFO("VerseLink starting up...");
     LOG_INFO("Configuration loaded successfully");
     LOG_INFO("Bible version: " + config.bibleVersion);
     LOG_INFO("Logging: " + std::string(config.enableLogging ? "enabled" : "disabled"));
     LOG_INFO("Debug mode: " + std::string(config.debugMode ? "enabled" : "disabled"));
-    
-    // Register hotkey from configuration
+
+    // Register the hotkey before starting the worker thread, so this failure
+    // path has no joinable std::thread to trip over on the way out.
     if (!RegisterAppHotkey(config.hotkeyModifiers, config.hotkeyVirtualKey)) {
         LOG_ERROR("Failed to register hotkey");
         return 1;
     }
-    
-    LOG_INFO("Hotkey registered successfully");
+    UpdateTrayTooltip();
+
+    LOG_INFO("Hotkey registered successfully: " +
+             DescribeHotkey(config.hotkeyModifiers, config.hotkeyVirtualKey));
     LOG_INFO("VerseLink is now running in the background");
-    
+
+    // Start the persistent worker thread that executes verse tasks
+    g_workerThread = std::thread(VerseLinkWorkerProc);
+
     // Run the main message loop
     bool success = RunVerseLink(hwnd, systemTray.get());
-    
+
     // Cleanup
     LOG_INFO("Cleaning up...");
     UnregisterHotKey(nullptr, MY_HOTKEY_ID);
-    
-    // Stop the worker thread and wait for any in-flight task to finish so we
-    // never exit while it is still touching globals or the clipboard.
-    g_shouldExit = true;
-    g_taskCV.notify_all();
-    if (g_workerThread.joinable()) {
-        g_workerThread.join();
-    }
-    
+    g_hotkeyRegistered = false;
+
+    ShutdownWorker();
+
     LOG_INFO("VerseLink shutdown complete");
     return success ? 0 : 1;
 }

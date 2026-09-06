@@ -40,9 +40,25 @@ SettingsDialog::~SettingsDialog() {
     }
 }
 
+bool SettingsDialog::IsOpen() {
+    return instance != nullptr && instance->hwnd != nullptr;
+}
+
+bool SettingsDialog::FocusExisting() {
+    if (!IsOpen()) return false;
+    SetForegroundWindow(instance->hwnd);
+    return true;
+}
+
 bool SettingsDialog::Show() {
+    if (IsOpen()) {
+        // Never stack two dialogs; surface the one already up.
+        FocusExisting();
+        return false;
+    }
+
     instance = this;
-    
+
     if (!EnsureSettingsClassRegistered()) {
         LogMessage("Failed to register dialog class");
         instance = nullptr;
@@ -68,40 +84,56 @@ bool SettingsDialog::Show() {
         return false;
     }
     
+    // Let the window procedure find this object without going through a shared
+    // static, so a second dialog can never make this one act on its data.
+    SetWindowLongPtr(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+
     CreateControls();
     LoadCurrentSettings();
-    
+
     // Show dialog
     ShowWindow(hwnd, SW_SHOW);
     UpdateWindow(hwnd);
-    
+
     // Modal message loop. While it runs, thread messages (no target window)
     // arrive here instead of the main loop, so they must be handled explicitly:
     // - WM_QUIT is re-posted so the main message loop can shut the app down.
     // - WM_HOTKEY would otherwise be silently dropped by DispatchMessage.
     MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0) > 0) {
-        if (msg.message == WM_QUIT) {
+    for (;;) {
+        const int result = GetMessage(&msg, nullptr, 0, 0);
+
+        if (result == 0) {
+            // WM_QUIT. GetMessage reports it by returning 0, which means a
+            // `while (GetMessage(...) > 0)` loop never runs its body for it -
+            // so the old in-loop re-post was dead code and the quit message was
+            // consumed here, leaving the main loop blocked forever.
             PostQuitMessage(static_cast<int>(msg.wParam));
             break;
         }
-        
+
+        if (result == -1) {
+            LogMessage("GetMessage failed in the settings dialog loop");
+            break;
+        }
+
         if (msg.message == WM_HOTKEY && msg.wParam == MY_HOTKEY_ID) {
             QueueHotkeyTask();
             continue; // keep servicing the dialog
         }
-        
+
         if (!IsDialogMessage(hwnd, &msg)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
         }
-        
+
         // Check if window was destroyed
         if (!IsWindow(hwnd)) {
             break;
         }
     }
-    
+
+
     if (instance == this) {
         instance = nullptr;
     }
@@ -149,7 +181,7 @@ void SettingsDialog::CreateControls() {
     currentY += VERTICAL_SPACING;
     
     // Use Existing Clipboard
-    CreateWindowW(L"BUTTON", L"Use Existing Clipboard First", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
+    CreateWindowW(L"BUTTON", L"Restore Clipboard After Replacing", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX,
         START_X, currentY, FIELD_WIDTH + LABEL_WIDTH, FIELD_HEIGHT, hwnd, (HMENU)ID_USE_EXISTING_CLIPBOARD, GetModuleHandle(nullptr), nullptr);
     currentY += VERTICAL_SPACING;
     
@@ -464,6 +496,10 @@ void SettingsDialog::BrowseForIcon() {
 }
 
 LRESULT CALLBACK SettingsDialog::DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
+    // Resolved per window rather than from the shared static, so this handler
+    // always operates on the dialog the message was actually sent to.
+    SettingsDialog* self = reinterpret_cast<SettingsDialog*>(GetWindowLongPtr(hDlg, GWLP_USERDATA));
+
     switch (message) {
         case WM_PAINT:
             {
@@ -483,25 +519,25 @@ LRESULT CALLBACK SettingsDialog::DialogProc(HWND hDlg, UINT message, WPARAM wPar
         case WM_COMMAND:
             switch (LOWORD(wParam)) {
                 case ID_SAVE:
-                    if (instance) {
-                        instance->SaveSettings();
+                    if (self) {
+                        self->SaveSettings();
                     }
                     DestroyWindow(hDlg);
                     return 0;
-                    
+
                 case ID_CANCEL:
                     DestroyWindow(hDlg);
                     return 0;
-                    
+
                 case ID_RESET_DEFAULTS:
-                    if (instance) {
-                        instance->ResetToDefaults();
+                    if (self) {
+                        self->ResetToDefaults();
                     }
                     return 0;
-                    
+
                 case ID_BROWSE_ICON:
-                    if (instance) {
-                        instance->BrowseForIcon();
+                    if (self) {
+                        self->BrowseForIcon();
                     }
                     return 0;
             }
@@ -513,11 +549,13 @@ LRESULT CALLBACK SettingsDialog::DialogProc(HWND hDlg, UINT message, WPARAM wPar
             
         case WM_DESTROY:
             // Don't call PostQuitMessage - it closes the entire app.
-            // Clear the stale instance pointer so it is never dereferenced
-            // after the window is gone.
-            if (instance && instance->hwnd == hDlg) {
-                instance->hwnd = nullptr;
+            // Clear this dialog's handle so the modal loop exits and the
+            // destructor does not call DestroyWindow on a dead (or recycled)
+            // window.
+            if (self) {
+                self->hwnd = nullptr;
             }
+            SetWindowLongPtr(hDlg, GWLP_USERDATA, 0);
             return 0;
     }
     

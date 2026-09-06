@@ -11,8 +11,16 @@
   "debugMode": false,
   "includeReferenceInReplacement": true,
   "replacementFormat": "{reference} {text}",
+  "preferDirectSelection": true,
+  "useExistingClipboard": true,
+  "iconPath": "",
   "showNotifications": false,
   "notificationDurationMs": 3000,
   "maxConcurrentTasks": 1,
-  "taskTimeoutMs": 5000
+  "taskTimeoutMs": 5000,
+  "includeVerseNumbers": true,
+  "newLineBetweenChapters": true,
+  "newLineBetweenBooks": true,
+  "referenceOnFirstLine": true,
+  "dynamicReference": false
 }

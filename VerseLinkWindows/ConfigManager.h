@@ -38,7 +38,7 @@ struct VerseLinkConfig {
     
     // Text selection settings
     bool preferDirectSelection = true; // Try UI Automation and edit controls first
-    bool useExistingClipboard = true;  // Use existing clipboard content before sending Ctrl+C
+    bool useExistingClipboard = true;  // Restore the previous clipboard content after a replacement
     
     // UI settings
     bool showNotifications = false;

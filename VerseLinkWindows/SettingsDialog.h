@@ -55,8 +55,18 @@ public:
     
     static LRESULT CALLBACK DialogProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam);
     bool Show();
-    
+
+    // The modal loop in Show() still dispatches tray messages, so the tray can
+    // be used while a dialog is open. Opening a second one used to clobber the
+    // first, silently turning its Save into a no-op; callers check IsOpen()
+    // and surface the existing window instead.
+    static bool IsOpen();
+    static bool FocusExisting();
+
 private:
+    // Tracks the open dialog for IsOpen()/FocusExisting() only. The window
+    // procedure resolves its own instance from GWLP_USERDATA so it can never
+    // act on a different dialog's object.
     static SettingsDialog* instance;
 };
 

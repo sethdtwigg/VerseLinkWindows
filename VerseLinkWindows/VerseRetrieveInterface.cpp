@@ -101,28 +101,44 @@ bool VerseRetrieveInterface::parseSingleReference(const std::string& refStr) {
     
     LogMessage("Parsing reference: " + refStr);
     
-    // Enhanced regex patterns for Bible references
+    // Enhanced regex patterns for Bible references.
+    //
     // Order matters: more specific patterns first; single verse must be tried
     // before multiple verses, otherwise "John 3:16" matches the [\d,]+ list pattern.
-    std::vector<std::regex> patterns = {
+    //
+    // The separator class is plain ASCII '-' on purpose. std::regex here is
+    // byte-oriented, so a multi-byte en/em dash inside a bracket expression only
+    // ever matches its first byte and the pattern fails - which is why ranges
+    // copied out of Word or a browser never matched. Callers normalise the input
+    // through StringExtensions::NormalizeReferenceText first, which folds every
+    // Unicode dash to '-'. Keep this file ASCII-only.
+    //
+    // The book group allows several alphabetic words, so multi-word names parse
+    // at all: with a single [a-zA-Z]+ run, "Song of Solomon 2:1", "I Corinthians
+    // 13:4" and "1st John 1:9" could never match, no matter what the alias table
+    // said - the group ended at "Song" / "I" / "st" and the chapter never lined up.
+    //
+    // Built once: constructing nine std::regex objects is expensive and this
+    // runs on every parsed reference.
+    static const std::vector<std::regex> patterns = {
         // Cross-chapter verse range with book repeated: "Romans 8:28 - Romans 9:1"
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+)\s*[-��]\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+)\s*$)", std::regex_constants::icase),
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+(?:\s+[a-zA-Z]+)*)\s+(\d+):(\d+)\s*[-]\s*([0-9]*\s*[a-zA-Z]+(?:\s+[a-zA-Z]+)*)\s+(\d+):(\d+)\s*$)", std::regex_constants::icase),
         // Cross-chapter verse range: "Romans 8:28-9:1"
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+)\s*[-��]\s*(\d+):(\d+)\s*$)", std::regex_constants::icase),
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+(?:\s+[a-zA-Z]+)*)\s+(\d+):(\d+)\s*[-]\s*(\d+):(\d+)\s*$)", std::regex_constants::icase),
         // Book range (e.g., "Jonah 1 - Micah 1")
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+)\s*[-��]\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+)\s*$)", std::regex_constants::icase),
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+(?:\s+[a-zA-Z]+)*)\s+(\d+)\s*[-]\s*([0-9]*\s*[a-zA-Z]+(?:\s+[a-zA-Z]+)*)\s+(\d+)\s*$)", std::regex_constants::icase),
         // Book range without chapters (e.g., "Genesis - Exodus")
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s*[-��]\s*([0-9]*\s*[a-zA-Z]+)\s*$)", std::regex_constants::icase),
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+(?:\s+[a-zA-Z]+)*)\s*[-]\s*([0-9]*\s*[a-zA-Z]+(?:\s+[a-zA-Z]+)*)\s*$)", std::regex_constants::icase),
         // Chapter range (e.g., "John 1-2")
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+)\s*[-��]\s*(\d+)\s*$)", std::regex_constants::icase),
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+(?:\s+[a-zA-Z]+)*)\s+(\d+)\s*[-]\s*(\d+)\s*$)", std::regex_constants::icase),
         // Book Chapter:Verse-EndVerse (e.g., "Romans 8:1-5")
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+)\s*[-��]\s*(\d+)\s*$)", std::regex_constants::icase),
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+(?:\s+[a-zA-Z]+)*)\s+(\d+):(\d+)\s*[-]\s*(\d+)\s*$)", std::regex_constants::icase),
         // Book Chapter:Verse (e.g., "John 3:16") - must precede the comma-list pattern
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+)\s*$)", std::regex_constants::icase),
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+(?:\s+[a-zA-Z]+)*)\s+(\d+):(\d+)\s*$)", std::regex_constants::icase),
         // Multiple verses (e.g., "John 3:16,18,20") - requires at least one comma
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+):(\d+(?:\s*,\s*\d+)+)\s*$)", std::regex_constants::icase),
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+(?:\s+[a-zA-Z]+)*)\s+(\d+):(\d+(?:\s*,\s*\d+)+)\s*$)", std::regex_constants::icase),
         // Book Chapter (e.g., "Genesis 1")
-        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+)\s+(\d+)\s*$)", std::regex_constants::icase)
+        std::regex(R"(^\s*([0-9]*\s*[a-zA-Z]+(?:\s+[a-zA-Z]+)*)\s+(\d+)\s*$)", std::regex_constants::icase)
     };
     
     for (size_t i = 0; i < patterns.size(); ++i) {
@@ -302,19 +318,28 @@ bool VerseRetrieveInterface::parseBibleReference()
         return false;
     }
     
+    // Fold Unicode punctuation (en/em dashes, non-breaking spaces, zero-width
+    // characters) to ASCII before anything looks at the text. Selections copied
+    // from Word, Outlook or a web page carry an en dash in ranges, which the
+    // byte-oriented patterns below cannot match.
+    const std::string normalized = StringExtensions::NormalizeReferenceText(UserInput);
+    if (normalized != UserInput) {
+        LogMessage("Normalized input to: " + normalized);
+    }
+
     // Try the input as a single reference first so formats that legitimately
     // contain separators (e.g., "John 3:16,18,20") are not torn apart.
-    std::string trimmed = UserInput;
+    std::string trimmed = normalized;
     trimmed.erase(0, trimmed.find_first_not_of(" \t\n\r\f\v"));
     trimmed.erase(trimmed.find_last_not_of(" \t\n\r\f\v") + 1);
-    
+
     if (!trimmed.empty() && parseSingleReference(trimmed)) {
         LogMessage("Successfully parsed 1 reference(s)");
         return true;
     }
-    
+
     // Fall back to splitting multiple references (semicolons, commas, "and")
-    auto refStrings = splitMultipleReferences(UserInput);
+    auto refStrings = splitMultipleReferences(normalized);
     
     bool success = false;
     for (const auto& refStr : refStrings) {
@@ -434,6 +459,10 @@ std::string VerseRetrieveInterface::getMultipleVerses(const XMLElement* chapterN
 bool VerseRetrieveInterface::GetVerseText() {
     try {
         std::string resultString = "";
+        // Success is "we actually appended verse text", never "resultString is
+        // non-empty" - otherwise a reference that resolves to no verses reports
+        // success and the caller pastes the bare reference over the selection.
+        bool anyVerseRetrieved = false;
 
         // Nothing parsed -> nothing to look up. Returning early prevents
         // whitespace-only output from being treated as a successful lookup.
@@ -500,17 +529,12 @@ bool VerseRetrieveInterface::GetVerseText() {
             }
         }
 
+        // The reference is published via ReferenceText only. Placing it into
+        // resultString here as well is what made includeReferenceInReplacement
+        // behave backwards, and made a lookup that found no verses still look
+        // like a success. VerseLinkTask owns reference placement; this function
+        // returns verse text and nothing else.
         ReferenceText = referenceText;
-
-        if (!config.includeReferenceInReplacement() && !referenceText.empty()) {
-            if (config.referenceOnFirstLine()) {
-                resultString = referenceText + "\n";
-            } else {
-                resultString = referenceText + " ";
-            }
-        } else if (config.referenceOnFirstLine()) {
-            resultString = "\n";
-        }
 
         auto appendWithSeparator = [](std::string& target, const std::string& addition, const std::string& separator) {
             if (addition.empty()) return;
@@ -687,10 +711,10 @@ bool VerseRetrieveInterface::GetVerseText() {
                         LogMessage("Chapter not found: " + ref.BookName + " " + ref.ChapterNumber);
                         continue;
                     }
-                    auto verseNode = ParseXMLBible(chapterNode->FirstChildElement(), ref.VerseNumber);
-                    if (verseNode && verseNode->GetText()) {
-                        verseText = verseNode->GetText();
-                    } else {
+                    // Same path as ranges so includeVerseNumbers applies here too;
+                    // reading the node directly silently ignored that setting.
+                    verseText = getVersesFromChapter(chapterNode, ref.VerseNumber, ref.VerseNumber);
+                    if (verseText.empty()) {
                         LogMessage("Verse not found: " + ref.VerseNumber);
                     }
                 }
@@ -701,35 +725,40 @@ bool VerseRetrieveInterface::GetVerseText() {
                     resultString += " ";
                 }
                 resultString += verseText;
+                anyVerseRetrieved = true;
                 LogMessage("Successfully retrieved verse text");
             }
         }
-        
-        VerseText = resultString.empty() ? "" : prepareResult(resultString);
 
+        if (!anyVerseRetrieved) {
+            LogMessage("No verse text found for any references");
+            LastError = LastError.empty()
+                ? "No verse text found for " + (ReferenceText.empty() ? UserInput : ReferenceText)
+                : LastError;
+            VerseText.clear();
+            return false;
+        }
+
+        VerseText = prepareResult(resultString);
+
+        // With dynamicReference the reference already names the starting verse,
+        // so the leading verse number would just repeat it. Later verses keep
+        // their numbers, which is what marks where each one begins.
         if (config.dynamicReference() && config.includeVerseNumbers() && !references.empty()) {
             const std::string firstVerseNumber = references[0].VerseNumber;
             if (!firstVerseNumber.empty() && !VerseText.empty()) {
-                std::string prefix;
-                std::string body = VerseText;
-                if (!body.empty() && body.front() == '\n') {
-                    prefix = "\n";
-                    body.erase(0, 1);
-                }
-
                 const std::string token = firstVerseNumber + " ";
-                if (body.rfind(token, 0) == 0) {
-                    body.erase(0, token.size());
-                    VerseText = prefix + body;
+                if (VerseText.rfind(token, 0) == 0) {
+                    VerseText.erase(0, token.size());
                 }
             }
         }
-        
+
         if (VerseText.empty()) {
-            LogMessage("No verse text found for any references");
+            LogMessage("Verse text was empty after formatting");
             return false;
         }
-        
+
         LogMessage("Final verse text length: " + std::to_string(VerseText.length()));
         return true;
     }

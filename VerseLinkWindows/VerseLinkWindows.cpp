@@ -5,9 +5,11 @@
 #include "VerseFormatter.h"
 #include "SelfTest.h"
 #include "StringExtensions.h"
+#include "Version.h"
 #include <mutex>
 #include <atomic>
 #include <vector>
+#include <filesystem>
 #include <shellapi.h>
 
 // Global variable definitions
@@ -44,10 +46,33 @@ static std::atomic<bool> g_shouldExit(false);
 static DWORD g_mainThreadId = 0;
 static HWND g_mainWindow = nullptr;
 
+// Directory holding config.json; relative log paths resolve against it so an
+// installed copy writes its log beside its settings rather than into whatever
+// the working directory happens to be.
+static std::string g_configDirectory;
+
 // Hotkey registration state (for live re-registration when settings change)
 static bool g_hotkeyRegistered = false;
 static int g_registeredModifiers = 0;
 static int g_registeredVirtualKey = 0;
+
+// An absolute logFilePath is honoured as-is; a relative one lands beside
+// config.json. Left relative it would follow the working directory, so a
+// shortcut-launched copy would scatter logs and the tray's "View Log" would
+// read a different file than the one being written.
+std::string ResolveLogPath(const std::string& configuredPath) {
+    if (configuredPath.empty() || g_configDirectory.empty()) {
+        return configuredPath;
+    }
+
+    const std::filesystem::path path(StringExtensions::Utf8ToWide(configuredPath));
+    if (path.is_absolute()) {
+        return configuredPath;
+    }
+
+    const std::filesystem::path base(StringExtensions::Utf8ToWide(g_configDirectory));
+    return StringExtensions::WideToUtf8((base / path).wstring());
+}
 
 std::string DescribeHotkey(int modifiers, int virtualKey) {
     std::string description;
@@ -153,7 +178,7 @@ void OnSettingsChanged() {
     UpdateTrayTooltip();
 
     // Apply logger changes (level/outputs); reopen file if its path changed
-    Logger::initialize(config.logFilePath,
+    Logger::initialize(ResolveLogPath(config.logFilePath),
                        static_cast<LogLevel>(config.logLevel),
                        config.enableConsoleLogging, config.enableFileLogging);
 
@@ -275,8 +300,25 @@ bool RunVerseLink(HWND hwnd, SystemTray* systemTray) {
 
 bool GetConfiguration() {
     try {
+        // Settings live in %APPDATA%\VerseLink so an installed copy can write
+        // them. Only fall back to the working directory if that folder is
+        // unavailable, which is the old behaviour.
+        std::string configPath = ConfigManager::userConfigPath();
+        std::string migratedFrom;
+        if (configPath.empty()) {
+            configPath = "config.json";
+        } else {
+            // First run after an upgrade: carry settings over from the copy an
+            // older version kept beside the exe or in the working directory.
+            migratedFrom = ConfigManager::migrateLegacyConfig(
+                configPath, ConfigManager::legacyConfigPaths());
+        }
+
+        g_configDirectory = StringExtensions::WideToUtf8(
+            std::filesystem::path(StringExtensions::Utf8ToWide(configPath)).parent_path().wstring());
+
         // Initialize configuration manager
-        ConfigManager::initialize("config.json");
+        ConfigManager::initialize(configPath);
 
         // Register settings change callback
         ConfigManager::getInstance().setSettingsChangeCallback(OnSettingsChanged);
@@ -290,10 +332,13 @@ bool GetConfiguration() {
 
         // Initialize logger with config settings
         LogLevel logLevel = static_cast<LogLevel>(config.logLevel);
-        Logger::initialize(config.logFilePath, logLevel,
+        Logger::initialize(ResolveLogPath(config.logFilePath), logLevel,
                            config.enableConsoleLogging, config.enableFileLogging);
 
-        LOG_INFO("Configuration loaded from config.json");
+        LOG_INFO("Configuration loaded from " + configPath);
+        if (!migratedFrom.empty()) {
+            LOG_INFO("Migrated settings from a previous installation at " + migratedFrom);
+        }
         return true;
     }
     catch (const std::exception& e) {
@@ -374,11 +419,26 @@ int main()
         return 2;
     }
 
+    // Held for the life of the process. Two jobs:
+    //  - the installer names this mutex so it can tell VerseLink is running and
+    //    ask the user to close it, instead of failing on a locked exe mid-upgrade;
+    //  - it keeps a second copy from starting, which would otherwise add a second
+    //    tray icon and fight over the same hotkey.
+    // Named without a namespace prefix so it lives in the caller's session, which
+    // is what a per-user install wants and what the installer looks for.
+    HANDLE instanceMutex = CreateMutexW(nullptr, FALSE, VERSELINK_INSTANCE_MUTEX);
+    if (instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        std::cerr << "VerseLink is already running (check the system tray)." << std::endl;
+        CloseHandle(instanceMutex);
+        return 0;
+    }
+
     g_mainThreadId = GetCurrentThreadId();
 
     // Load configuration first (this also initializes the logger)
     if (!GetConfiguration()) {
         std::cerr << "Failed to load configuration, exiting..." << std::endl;
+        if (instanceMutex) CloseHandle(instanceMutex);
         return 1;
     }
 
@@ -393,6 +453,7 @@ int main()
 
     if (!RegisterClass(&wc)) {
         LOG_ERROR("Failed to register window class");
+        if (instanceMutex) CloseHandle(instanceMutex);
         return 1;
     }
 
@@ -408,6 +469,7 @@ int main()
 
     if (!hwnd) {
         LOG_ERROR("Failed to create window");
+        if (instanceMutex) CloseHandle(instanceMutex);
         return 1;
     }
     g_mainWindow = hwnd;
@@ -453,6 +515,7 @@ int main()
     // path has no joinable std::thread to trip over on the way out.
     if (!RegisterAppHotkey(config.hotkeyModifiers, config.hotkeyVirtualKey)) {
         LOG_ERROR("Failed to register hotkey");
+        if (instanceMutex) CloseHandle(instanceMutex);
         return 1;
     }
     UpdateTrayTooltip();
@@ -473,6 +536,8 @@ int main()
     g_hotkeyRegistered = false;
 
     ShutdownWorker();
+
+    if (instanceMutex) CloseHandle(instanceMutex);
 
     LOG_INFO("VerseLink shutdown complete");
     return success ? 0 : 1;

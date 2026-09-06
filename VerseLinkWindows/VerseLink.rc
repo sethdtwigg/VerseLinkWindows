@@ -1,0 +1,39 @@
+#include <windows.h>
+#include "Version.h"
+
+// Embedded application icon. Without this the exe has no icon of its own, so
+// Explorer, the taskbar and any installer-created shortcut fall back to the
+// generic executable icon.
+IDI_VERSELINK ICON "VerseLinkIcon.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    VERSELINK_VERSION_MAJOR,VERSELINK_VERSION_MINOR,VERSELINK_VERSION_PATCH,0
+ PRODUCTVERSION VERSELINK_VERSION_MAJOR,VERSELINK_VERSION_MINOR,VERSELINK_VERSION_PATCH,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+ FILEFLAGS      VS_FF_DEBUG
+#else
+ FILEFLAGS      0x0L
+#endif
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"   // U.S. English, Unicode
+        BEGIN
+            VALUE "CompanyName",      "sethdtwigg"
+            VALUE "FileDescription",  "VerseLink - Bible verse lookup and insertion"
+            VALUE "FileVersion",      VERSELINK_VERSION_STRING
+            VALUE "InternalName",     "VerseLinkWindows"
+            VALUE "OriginalFilename", "VerseLinkWindows.exe"
+            VALUE "ProductName",      "VerseLink"
+            VALUE "ProductVersion",   VERSELINK_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

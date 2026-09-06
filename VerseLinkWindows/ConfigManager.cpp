@@ -1,10 +1,39 @@
 #include "ConfigManager.h"
 #include "Logger.h"
+#include "StringExtensions.h"
 #include <fstream>
 #include <sstream>
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <shlobj.h>
+
+// Declared here rather than on the link line so this file stays self-contained:
+// the test harness compiles it with a bare cl invocation that has no library
+// list of its own. SHGetKnownFolderPath needs shell32, CoTaskMemFree ole32.
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
+
+namespace {
+    // Config paths are UTF-8 like every other string here, but MSVC's narrow
+    // fstream constructors interpret char* paths in the ANSI codepage. Going
+    // through a wide std::filesystem::path keeps a user whose profile name is
+    // not representable in that codepage working.
+    std::filesystem::path AsPath(const std::string& utf8Path) {
+        return std::filesystem::path(StringExtensions::Utf8ToWide(utf8Path));
+    }
+
+    std::string ExecutableDirectory() {
+        wchar_t buffer[MAX_PATH] = {};
+        const DWORD length = GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+        if (length == 0 || length >= MAX_PATH) return "";
+
+        std::wstring path(buffer, length);
+        const size_t slash = path.find_last_of(L"\\/");
+        if (slash == std::wstring::npos) return "";
+        return StringExtensions::WideToUtf8(path.substr(0, slash));
+    }
+}
 
 // Static member definitions
 std::unique_ptr<ConfigManager> ConfigManager::instance = nullptr;
@@ -30,6 +59,67 @@ void ConfigManager::initialize(const std::string& configFilePath) {
 
 void ConfigManager::setDefaults() {
     config = VerseLinkConfig(); // Use default values from struct
+}
+
+std::string ConfigManager::userConfigPath() {
+    PWSTR roaming = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &roaming)) || !roaming) {
+        if (roaming) CoTaskMemFree(roaming);
+        return "";
+    }
+
+    std::filesystem::path directory(roaming);
+    CoTaskMemFree(roaming);
+    directory /= L"VerseLink";
+
+    std::error_code ec;
+    std::filesystem::create_directories(directory, ec);
+    if (ec) {
+        return "";
+    }
+
+    return StringExtensions::WideToUtf8((directory / L"config.json").wstring());
+}
+
+std::vector<std::string> ConfigManager::legacyConfigPaths() {
+    std::vector<std::string> candidates;
+
+    // Beside the exe first: that is where an unzipped copy kept its settings.
+    const std::string exeDir = ExecutableDirectory();
+    if (!exeDir.empty()) {
+        candidates.push_back(exeDir + "\\config.json");
+    }
+
+    // Then the working directory, which is what the app used to load from.
+    candidates.push_back("config.json");
+    return candidates;
+}
+
+std::string ConfigManager::migrateLegacyConfig(const std::string& targetPath,
+                                               const std::vector<std::string>& candidates) {
+    if (targetPath.empty()) return "";
+
+    std::error_code ec;
+    const std::filesystem::path target = AsPath(targetPath);
+    if (std::filesystem::exists(target, ec)) {
+        return ""; // never overwrite settings that are already in place
+    }
+
+    for (const auto& candidate : candidates) {
+        if (candidate.empty()) continue;
+
+        const std::filesystem::path source = AsPath(candidate);
+        if (std::filesystem::equivalent(source, target, ec)) continue;
+        if (!std::filesystem::is_regular_file(source, ec)) continue;
+
+        std::filesystem::copy_file(source, target,
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        if (!ec) {
+            return candidate;
+        }
+    }
+
+    return "";
 }
 
 std::string ConfigManager::expandPath(const std::string& path) {
@@ -114,7 +204,7 @@ bool ConfigManager::load() {
         return false;
     }
     
-    std::ifstream file(configFilePath);
+    std::ifstream file(AsPath(configFilePath));
     if (!file.is_open()) {
         LOG_WARNING("Config file not found: " + configFilePath + ", creating with defaults");
         save(); // Create default config file
@@ -196,7 +286,7 @@ bool ConfigManager::save() {
         }
         const VerseLinkConfig& config = snapshot;
 
-        std::ofstream file(configFilePath);
+        std::ofstream file(AsPath(configFilePath));
         if (!file.is_open()) {
             LOG_ERROR("Failed to open config file for writing: " + configFilePath);
             return false;

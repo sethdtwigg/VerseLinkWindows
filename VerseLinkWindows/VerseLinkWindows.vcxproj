@@ -156,6 +156,9 @@
     <ClCompile Include="VerseRetrieveInterface.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ResourceCompile Include="VerseLink.rc" />
+  </ItemGroup>
+  <ItemGroup>
     <ClInclude Include="Bible.h" />
     <ClInclude Include="ClipboardInterface.h" />
     <ClInclude Include="ConfigManager.h" />
@@ -167,6 +170,7 @@
     <ClInclude Include="TaskQueue.h" />
     <ClInclude Include="tinyxml2.h" />
     <ClInclude Include="VerseFormatter.h" />
+    <ClInclude Include="Version.h" />
     <ClInclude Include="VerseLinkWindows.h" />
     <ClInclude Include="VerseRetrieveInterface.h" />
   </ItemGroup>

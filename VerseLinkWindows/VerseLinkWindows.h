@@ -36,6 +36,12 @@ void QueueHotkeyTask();
 // text reflects the configured combination instead of a hardcoded one.
 std::string DescribeHotkey(int modifiers, int virtualKey);
 
+// Turns a configured logFilePath into the path actually being written: absolute
+// paths as-is, relative ones resolved beside config.json. Anything that reads
+// the log must go through this, or it will read a different file than the one
+// the logger is writing.
+std::string ResolveLogPath(const std::string& configuredPath);
+
 // Function declarations
 void VerseLinkTask();
 bool RunVerseLink(HWND hwnd, SystemTray* systemTray);

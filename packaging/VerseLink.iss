@@ -20,6 +20,8 @@
 #define AppPublisher   "sethdtwigg"
 #define AppURL         "https://github.com/sethdtwigg/VerseLinkWindows"
 #define AppMutexName   "VerseLinkWindows.SingleInstance"
+; Must match the class registered in VerseLinkWindows.cpp.
+#define AppWindowClass "VerseLinkHiddenWindow"
 #define BackupDirName  "previous-versions"
 
 #ifndef AppVersion
@@ -56,13 +58,16 @@ DisableDirPage=no
 AlwaysShowDirOnReadyPage=yes
 UsePreviousAppDir=yes
 
-; The app holds this mutex while running. A tray app keeps its own exe locked,
-; so without this an update started while VerseLink is running would fail part
-; way through. CloseApplications lets Setup shut it down through Restart
-; Manager; the app handles WM_QUERYENDSESSION/WM_ENDSESSION so that is a clean
-; exit rather than a kill. Restarting is handled in [Code] instead of by
-; RestartApplications, so it happens exactly once.
-AppMutex={#AppMutexName}
+; A tray app keeps its own exe locked, so a running VerseLink has to be closed
+; before its executable can be replaced.
+;
+; AppMutex is deliberately NOT used. It only *blocks*: it tells the user to
+; close the app and aborts if they do not, which fails outright under /SILENT
+; ("Defaulting to Cancel for suppressed message box... Got EAbort exception").
+; Instead PrepareToInstall closes VerseLink itself by posting WM_CLOSE to its
+; window, which the app handles as a clean shutdown. CloseApplications stays on
+; as a Restart Manager backstop for any other locked file, and restarting is
+; done in [Code] rather than by RestartApplications so it happens exactly once.
 CloseApplications=yes
 RestartApplications=no
 
@@ -140,6 +145,49 @@ end;
 function NotRunningBeforeInstall(): Boolean;
 begin
   Result := not WasRunning;
+end;
+
+// Closes a running VerseLink the way its own tray Quit does: WM_CLOSE to the
+// hidden window, which the app handles by shutting down cleanly (removing its
+// tray icon, releasing the hotkey and joining its worker thread). Waits for the
+// single-instance mutex to clear so the exe is genuinely unlocked before Setup
+// tries to replace it.
+function CloseRunningInstance(): Boolean;
+var
+  Wnd: HWND;
+  Waited: Integer;
+begin
+  Result := True;
+  if not CheckForMutexes('{#AppMutexName}') then
+    exit;
+
+  Wnd := FindWindowByClassName('{#AppWindowClass}');
+  if Wnd <> 0 then
+  begin
+    Log('Asking the running VerseLink to close');
+    PostMessage(Wnd, $0010 { WM_CLOSE }, 0, 0);
+  end
+  else
+    Log('VerseLink appears to be running but its window was not found');
+
+  Waited := 0;
+  while (Waited < 15000) and CheckForMutexes('{#AppMutexName}') do
+  begin
+    Sleep(250);
+    Waited := Waited + 250;
+  end;
+
+  Result := not CheckForMutexes('{#AppMutexName}');
+  if Result then
+    Log('Running VerseLink closed after ' + IntToStr(Waited) + ' ms');
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  if not CloseRunningInstance() then
+    Result := 'VerseLink is still running and could not be closed automatically.' + #13#10 +
+              'Close it from its system tray icon, then run Setup again.';
 end;
 
 // Keeps the outgoing executable instead of letting it be overwritten. Named by

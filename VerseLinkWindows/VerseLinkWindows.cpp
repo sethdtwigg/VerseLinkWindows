@@ -471,6 +471,9 @@ int main()
     WNDCLASS wc = {};
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = GetModuleHandle(nullptr);
+    // The installer finds this window by class name to ask VerseLink to close
+    // before it replaces the exe (packaging\VerseLink.iss, AppWindowClass).
+    // Renaming it breaks that, and updates would fail on a locked file.
     wc.lpszClassName = L"VerseLinkHiddenWindow";
 
     if (!RegisterClass(&wc)) {

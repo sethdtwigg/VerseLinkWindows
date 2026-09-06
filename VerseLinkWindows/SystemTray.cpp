@@ -3,12 +3,25 @@
 #include "Logger.h"
 #include "SettingsDialog.h"
 #include "StringExtensions.h"
-#include "VerseLinkWindows.h" // DescribeHotkey
+#include "VerseLinkWindows.h" // DescribeHotkey, ResolveLogPath
+#include "Version.h"
 #include <fstream>
 #include <sstream>
 #include <commctrl.h>
 
 #pragma comment(lib, "comctl32.lib")
+
+namespace {
+    // The icon compiled into the exe, falling back to the generic application
+    // icon if the resource is missing. Before VerseLink.rc existed the exe had
+    // no icon at all, so the tray showed the default executable glyph.
+    HICON DefaultAppIcon() {
+        if (HICON icon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDI_VERSELINK))) {
+            return icon;
+        }
+        return LoadIcon(nullptr, IDI_APPLICATION);
+    }
+}
 
 SystemTray::SystemTray(HWND parentHwnd) : hwnd(parentHwnd), isVisible(false), hCustomIcon(nullptr) {
     ZeroMemory(&nid, sizeof(NOTIFYICONDATA));
@@ -35,7 +48,7 @@ bool SystemTray::Initialize() {
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAYICON;
-    nid.hIcon = hCustomIcon ? hCustomIcon : LoadIcon(nullptr, IDI_APPLICATION);
+    nid.hIcon = hCustomIcon ? hCustomIcon : DefaultAppIcon();
     wcscpy_s(nid.szTip, sizeof(nid.szTip)/sizeof(WCHAR), L"VerseLink");
     
     return true;
@@ -173,7 +186,7 @@ void SystemTray::ShowAboutDialog() {
     // ASCII-only; literal Unicode here has been corrupted by a bad round-trip
     // before, and CI now rejects non-ASCII bytes in sources.
     const std::wstring aboutText =
-        L"VerseLink v1.0\n\n"
+        L"VerseLink " VERSELINK_VERSION_WIDE L"\n\n"
         L"A Bible verse lookup and insertion tool.\n\n"
         L"Features:\n"
         L"\u2022 Hotkey-activated verse lookup (" + hotkey + L")\n"
@@ -192,7 +205,7 @@ void SystemTray::ShowLogDialog() {
     // Read log file content
     std::string logContent;
     auto& config = ConfigManager::getInstance();
-    std::string logPath = config.getLogFilePath();
+    std::string logPath = ResolveLogPath(config.getLogFilePath());
     
     std::ifstream logFile(logPath);
     if (logFile.is_open()) {
@@ -308,7 +321,7 @@ void SystemTray::SetCustomIcon(const std::string& iconPath) {
         }
     } else {
         // Fall back to default icon if custom failed
-        nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
+        nid.hIcon = DefaultAppIcon();
         if (isVisible) {
             if (Shell_NotifyIcon(NIM_MODIFY, &nid)) {
                 LogMessage("Reverted to default system tray icon");

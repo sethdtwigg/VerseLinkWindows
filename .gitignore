@@ -366,6 +366,7 @@ tests/*.exe
 tests/*.obj
 tests/test_config.json
 tests/test_config_reload.json
+tests/migrate_*.json
 # Rotation-test output: the harness rewrites these on every run, and the
 # .1/.2 suffixes fall outside the *.log rule above.
 tests/rotation_test.log.*

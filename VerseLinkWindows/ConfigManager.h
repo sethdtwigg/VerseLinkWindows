@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <vector>
 #include <windows.h>
 
 struct VerseLinkConfig {
@@ -78,6 +79,28 @@ private:
 public:
     static ConfigManager& getInstance();
     static void initialize(const std::string& configFilePath = "config.json");
+
+    // Where an installed run keeps its settings: %APPDATA%\VerseLink\config.json,
+    // creating the directory if needed. Returns "" if the folder cannot be found.
+    //
+    // The install directory is not a safe place for this file. The app runs
+    // AsInvoker, so it cannot write under Program Files - saves would fail, or be
+    // silently redirected into VirtualStore where the app then reads a different
+    // file than the one on disk. A CWD-relative "config.json" is worse still:
+    // launched from a Start Menu shortcut the working directory is not the
+    // install folder, so settings would neither load nor save where expected.
+    static std::string userConfigPath();
+
+    // Config files an older version may have left beside the exe or in the
+    // working directory, in the order they should be preferred.
+    static std::vector<std::string> legacyConfigPaths();
+
+    // Copies the first candidate that exists to targetPath, but only when
+    // targetPath does not exist yet, so an upgrading user keeps their settings
+    // and a later run never overwrites them. Returns the path migrated from, or
+    // "" when nothing was migrated. Paths are UTF-8.
+    static std::string migrateLegacyConfig(const std::string& targetPath,
+                                           const std::vector<std::string>& candidates);
     
     bool load();
     bool save();

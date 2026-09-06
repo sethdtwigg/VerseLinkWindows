@@ -12,6 +12,7 @@
 #include "StringExtensions.h"
 #include "TaskQueue.h"
 #include "VerseFormatter.h"
+#include "Version.h"
 #include "tinyxml2.h"
 
 #include <windows.h>
@@ -921,6 +922,88 @@ static void TestLoggerConcurrency() {
     Logger::initialize("verselink.log", Info, true, true);
 }
 
+// ---------------------------------------------------------------------------
+// Where settings live, and carrying them across an upgrade
+// ---------------------------------------------------------------------------
+
+static void TestConfigLocation() {
+    BeginSection("Config location and migration");
+    namespace fs = std::filesystem;
+
+    // The version string is parsed by the packaging script while the .rc uses
+    // the numeric components; drift between them would ship an installer whose
+    // version disagrees with the exe it installs.
+    const std::string composed = std::to_string(VERSELINK_VERSION_MAJOR) + "." +
+                                 std::to_string(VERSELINK_VERSION_MINOR) + "." +
+                                 std::to_string(VERSELINK_VERSION_PATCH);
+    CHECK(std::string(VERSELINK_VERSION_STRING) == composed,
+          "VERSELINK_VERSION_STRING (" VERSELINK_VERSION_STRING ") matches the numeric "
+          "components (" + composed + ")");
+
+    // Settings must not live in the install directory: the app runs AsInvoker,
+    // so under Program Files a save would fail or be redirected to VirtualStore.
+    const std::string userPath = ConfigManager::userConfigPath();
+    CHECK(!userPath.empty(), "userConfigPath() resolves");
+    if (!userPath.empty()) {
+        CHECK(userPath.find("VerseLink") != std::string::npos,
+              "user config path sits under a VerseLink folder, got '" + userPath + "'");
+        CHECK(userPath.size() > 11 && userPath.compare(userPath.size() - 11, 11, "config.json") == 0,
+              "user config path ends in config.json, got '" + userPath + "'");
+        CHECK(fs::exists(fs::path(StringExtensions::Utf8ToWide(userPath)).parent_path()),
+              "userConfigPath() created its directory");
+    }
+
+    const auto legacy = ConfigManager::legacyConfigPaths();
+    CHECK(!legacy.empty(), "legacy candidates are offered");
+    CHECK(std::find(legacy.begin(), legacy.end(), std::string("config.json")) != legacy.end(),
+          "the working-directory config is a migration candidate");
+
+    const std::string source = "tests/migrate_source.json";
+    const std::string target = "tests/migrate_target.json";
+    const std::string absent = "tests/migrate_absent.json";
+    for (const auto& path : { source, target, absent }) {
+        std::error_code ec;
+        fs::remove(path, ec);
+    }
+    { std::ofstream f(source); f << "{ \"bibleVersion\": \"NASB.xml\" }\n"; }
+
+    // Upgrading: settings are carried over from the first candidate that exists.
+    std::string from = ConfigManager::migrateLegacyConfig(target, { absent, source });
+    CHECK(from == source, "migrates from the first candidate that exists, got '" + from + "'");
+    CHECK(fs::exists(target), "the target config was created");
+
+    // Re-running must never clobber settings already in place.
+    { std::ofstream f(target); f << "{ \"bibleVersion\": \"ESV.xml\" }\n"; }
+    from = ConfigManager::migrateLegacyConfig(target, { source });
+    CHECK(from.empty(), "an existing target is never overwritten");
+    {
+        std::ifstream f(target);
+        std::stringstream buffer;
+        buffer << f.rdbuf();
+        CHECK(buffer.str().find("ESV.xml") != std::string::npos,
+              "the existing target's contents survive a second migration attempt");
+    }
+
+    // Nothing to migrate: no file is invented.
+    { std::error_code ec; fs::remove(target, ec); }
+    from = ConfigManager::migrateLegacyConfig(target, { absent });
+    CHECK(from.empty(), "no candidate means no migration");
+    CHECK(!fs::exists(target), "nothing is created when there is nothing to migrate");
+
+    // Degenerate inputs are refused rather than crashing.
+    CHECK(ConfigManager::migrateLegacyConfig("", { source }).empty(),
+          "an empty target path migrates nothing");
+    CHECK(ConfigManager::migrateLegacyConfig(target, {}).empty(),
+          "an empty candidate list migrates nothing");
+    CHECK(ConfigManager::migrateLegacyConfig(target, { source, source }).size() > 0,
+          "a real candidate still migrates after the degenerate cases");
+
+    for (const auto& path : { source, target }) {
+        std::error_code ec;
+        fs::remove(path, ec);
+    }
+}
+
 int main() {
     TestParsing();
     TestDashVariants();
@@ -934,6 +1017,7 @@ int main() {
     TestNonReferenceInput();
     TestTaskQueue();
     TestLoggerConcurrency();
+    TestConfigLocation();
     TestConfigRoundTrip();
     TestConfigConcurrency();
     TestLogRotation();

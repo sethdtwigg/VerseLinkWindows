@@ -1,0 +1,27 @@
+VerseLink - distribution notes
+==============================
+
+Bible translations
+------------------
+This package includes the King James Version (public domain).
+
+Other translations such as the NASB or ESV are copyrighted and are NOT
+included. To use one, obtain the text legally in the same XML format and place
+the file into the Bibles folder inside the installation directory, then pick it
+in the tray icon's Settings dialog.
+
+Where your files live
+---------------------
+Settings and log:  %APPDATA%\VerseLink
+Program files:     the folder you chose during installation
+
+Settings are kept when you upgrade. Uninstalling asks before removing them.
+
+Upgrading from a zip copy
+-------------------------
+If you previously ran VerseLink from an unzipped folder rather than an
+installer, that copy is invisible to this installer and will not be removed
+automatically - nothing recorded it as installed. Your settings are carried
+over on first run, but you should delete the old folder yourself, and remove
+its shortcut from your Startup folder if you added one, so you do not end up
+running two copies.

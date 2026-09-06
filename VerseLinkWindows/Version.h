@@ -13,8 +13,8 @@
 // must never reuse a version that has already shipped.
 #define VERSELINK_VERSION_MAJOR 1
 #define VERSELINK_VERSION_MINOR 1
-#define VERSELINK_VERSION_PATCH 0
-#define VERSELINK_VERSION_STRING "1.1.0"
+#define VERSELINK_VERSION_PATCH 1
+#define VERSELINK_VERSION_STRING "1.1.1"
 
 // Wide form for Win32 UI text, derived rather than duplicated so the two can
 // never drift apart.

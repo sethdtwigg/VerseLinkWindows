@@ -24,11 +24,34 @@ struct COMInitializer {
 };
 
 namespace {
+    // Clipboard ownership is contended - clipboard managers, editors and
+    // browsers all hold it for short bursts - so a single OpenClipboard fails
+    // often enough to matter. Retrying briefly turns a spurious failure into a
+    // success instead of an empty result that looks like "nothing was copied".
+    bool OpenClipboardWithRetry() {
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            if (OpenClipboard(NULL)) {
+                return true;
+            }
+            Sleep(50);
+        }
+        return false;
+    }
+
+    // Why a read produced no text. "The clipboard held nothing" and "we could
+    // not open the clipboard" are very different problems, and collapsing both
+    // to an empty string made them impossible to tell apart in the log.
+    enum class ClipboardRead {
+        Ok,
+        NoText,
+        OpenFailed
+    };
+
     void RestoreClipboardText(const std::string& utf8Text) {
         if (!ConfigManager::getInstance().useExistingClipboard()) {
             return; // user opted out of touching clipboard state on failure paths
         }
-        if (!OpenClipboard(NULL)) {
+        if (!OpenClipboardWithRetry()) {
             LOG_ERROR("Failed to open clipboard while restoring previous content");
             return;
         }
@@ -54,8 +77,9 @@ namespace {
         }
     }
 
-    std::string ReadClipboardTextUtf8() {
-        if (!OpenClipboard(NULL)) return std::string();
+    ClipboardRead ReadClipboardTextUtf8(std::string& out) {
+        out.clear();
+        if (!OpenClipboardWithRetry()) return ClipboardRead::OpenFailed;
         std::string result;
         if (HANDLE hData = GetClipboardData(CF_UNICODETEXT)) {
             if (wchar_t* psz = static_cast<wchar_t*>(GlobalLock(hData))) {
@@ -69,7 +93,8 @@ namespace {
             }
         }
         CloseClipboard();
-        return result;
+        out = result;
+        return result.empty() ? ClipboardRead::NoText : ClipboardRead::Ok;
     }
 
     bool WriteClipboardText(const std::string& utf8Text) {
@@ -85,7 +110,7 @@ namespace {
             }
         }
 
-        if (!OpenClipboard(NULL)) return false;
+        if (!OpenClipboardWithRetry()) return false;
         EmptyClipboard();
         bool ok = false;
         std::wstring wide = StringExtensions::Utf8ToWide(normalized);
@@ -257,7 +282,11 @@ std::string ClipboardInterface::GetSelectedTextUsingUIAutomation() {
         }
         
         if (result.empty()) {
-            LogError("UI Automation: No text selection found");
+            // Expected for editors that expose no TextPattern (Scintilla-based
+            // ones like Notepad++, for instance). The clipboard fallback handles
+            // it, so this is not an error - logging it as one set m_last_error
+            // on every successful run and made real failures hard to spot.
+            Log += "UI Automation: No text selection available, falling back\n";
         }
         
     } catch (const std::exception& e) {
@@ -283,8 +312,11 @@ std::string ClipboardInterface::GetSelectedTextFromEditControl() {
     wchar_t className[64] = {};
     GetClassNameW(m_target_window, className, ARRAYSIZE(className));
     if (_wcsicmp(className, L"Edit") != 0 && _wcsnicmp(className, L"RichEdit", 8) != 0) {
-        LogError("Target window is not an edit control (class: " +
-                 StringExtensions::WideToUtf8(className) + ")");
+        // Not an error: most windows are not edit controls, and this is a
+        // fallback path. Logging it as ERROR set m_last_error and buried real
+        // failures in noise.
+        Log += "Edit Control: Target window is not an edit control (class: " +
+               StringExtensions::WideToUtf8(className) + "), falling back to the clipboard\n";
         return "";
     }
 
@@ -322,9 +354,45 @@ std::string ClipboardInterface::GetSelectedTextFromEditControl() {
     return StringExtensions::WideToUtf8(buffer.substr(start, end - start));
 }
 
+// Releases modifier keys the user is still physically holding.
+//
+// This runs a fraction of a second after the hotkey fired, and nobody lets go
+// of Ctrl+Alt+L that fast. A physically held Alt combines with anything we
+// synthesise, so the target application receives Ctrl+Alt+C rather than Ctrl+C
+// and copies nothing - which looked exactly like "no text was selected".
+//
+// Ctrl is left alone: the combinations we send press it themselves, and their
+// trailing key-up releases it either way.
+void ClipboardInterface::ReleaseHeldModifiers() {
+    static const WORD modifiers[] = {
+        VK_LMENU, VK_RMENU, VK_MENU,       // Alt
+        VK_LSHIFT, VK_RSHIFT, VK_SHIFT,    // Shift
+        VK_LWIN, VK_RWIN                   // Windows
+    };
+
+    std::vector<INPUT> inputs;
+    for (WORD key : modifiers) {
+        if (GetAsyncKeyState(key) & 0x8000) {
+            INPUT input = {};
+            input.type = INPUT_KEYBOARD;
+            input.ki.wVk = key;
+            input.ki.dwFlags = KEYEVENTF_KEYUP;
+            inputs.push_back(input);
+            Log += "SendKeys: releasing held modifier " + std::to_string(key) + "\n";
+        }
+    }
+
+    if (!inputs.empty()) {
+        SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
+        Sleep(30); // let the target see the release before the combination
+    }
+}
+
 bool ClipboardInterface::SendKeys(const std::vector<WORD>& keys) {
     Log += "SendKeys: Starting with " + std::to_string(keys.size()) + " keys\n";
-    
+
+    ReleaseHeldModifiers();
+
     std::vector<INPUT> inputs;
     
     // Key down events
@@ -376,39 +444,80 @@ std::string ClipboardInterface::GetSelectedTextUsingClipboard() {
     
     // Save current clipboard content (Unicode preserving)
     std::string oldClipboard;
-    oldClipboard = ReadClipboardTextUtf8();
-    if (!oldClipboard.empty()) {
-        Log += "Clipboard: Saved previous clipboard content\n";
+    switch (ReadClipboardTextUtf8(oldClipboard)) {
+        case ClipboardRead::Ok:
+            Log += "Clipboard: Saved previous clipboard content\n";
+            break;
+        case ClipboardRead::NoText:
+            Log += "Clipboard: Nothing to save, the clipboard holds no text\n";
+            break;
+        case ClipboardRead::OpenFailed:
+            Log += "Clipboard: Could not open the clipboard to save its previous content\n";
+            break;
     }
-    
+
+    // Recorded so we can tell whether Ctrl+C actually did anything. The counter
+    // advances on every clipboard update regardless of content, so it is a
+    // reliable signal even when the copied text matches what was already there.
+    const DWORD sequenceBefore = GetClipboardSequenceNumber();
+
     // Always send Ctrl+C: copying is the only reliable way to capture the
     // live selection (previously a test-only forceCopy flag skipped this and
     // made the result depend on stale clipboard content).
     Log += "Clipboard: Sending Ctrl+C to copy selection\n";
-    
+
     // Send Ctrl+C to copy selected text
     std::vector<WORD> keys = {VK_CONTROL, 'C'};
     if (!SendKeys(keys)) {
         LogError("Failed to send Ctrl+C");
         return "";
     }
-    
-    Sleep(300); // Wait for copy operation in modern applications
-    
-    // Get new clipboard content
-    std::string selectedText = ReadClipboardTextUtf8();
-    if (!selectedText.empty()) {
-        Log += "Clipboard: Retrieved selection (" + std::to_string(selectedText.length()) + " chars)\n";
-    } else {
-        LogError("Clipboard: No text found after copy operation");
+
+    // Wait for the copy to land rather than guessing at a delay. A fixed sleep
+    // was both too short for slow applications and wasted time for fast ones.
+    bool clipboardChanged = false;
+    int waitedMs = 0;
+    const int maxWaitMs = 1500;
+    while (waitedMs < maxWaitMs) {
+        if (GetClipboardSequenceNumber() != sequenceBefore) {
+            clipboardChanged = true;
+            break;
+        }
+        Sleep(50);
+        waitedMs += 50;
     }
-    
+
+    if (!clipboardChanged) {
+        // The clipboard was never updated, so nothing was copied. Either no text
+        // was selected, or the application ignored the keystroke. Nothing was
+        // altered, so there is nothing to restore.
+        LogError("Clipboard: Ctrl+C did not change the clipboard after " +
+                 std::to_string(maxWaitMs) + "ms - was any text selected?");
+        return "";
+    }
+
+    Log += "Clipboard: Copy landed after " + std::to_string(waitedMs) + "ms\n";
+
+    // Get new clipboard content
+    std::string selectedText;
+    switch (ReadClipboardTextUtf8(selectedText)) {
+        case ClipboardRead::Ok:
+            Log += "Clipboard: Retrieved selection (" + std::to_string(selectedText.length()) + " chars)\n";
+            break;
+        case ClipboardRead::NoText:
+            LogError("Clipboard: The copy produced no text - the selection may be an image or other non-text content");
+            break;
+        case ClipboardRead::OpenFailed:
+            LogError("Clipboard: The copy succeeded but the clipboard could not be opened to read it");
+            break;
+    }
+
     // Restore original clipboard if no new content
     if (selectedText.empty() && !oldClipboard.empty()) {
         Log += "Clipboard: No new content, restoring original clipboard\n";
         RestoreClipboardText(oldClipboard);
     }
-    
+
     return selectedText;
 }
 
@@ -474,8 +583,8 @@ bool ClipboardInterface::ReplaceSelectedText(const std::string& newText) {
     
     // Save current clipboard (Unicode preserving)
     Log += "ReplaceSelectedText: Saving current clipboard\n";
-    std::string oldClipboard = ReadClipboardTextUtf8();
-    if (!oldClipboard.empty()) {
+    std::string oldClipboard;
+    if (ReadClipboardTextUtf8(oldClipboard) == ClipboardRead::Ok) {
         Log += "ReplaceSelectedText: Saved previous clipboard content\n";
     }
     

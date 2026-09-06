@@ -13,15 +13,29 @@ in the tray icon's Settings dialog.
 Where your files live
 ---------------------
 Settings and log:  %APPDATA%\VerseLink
-Program files:     the folder you chose during installation
+Program files:     the folder you choose during installation
 
-Settings are kept when you upgrade. Uninstalling asks before removing them.
+Settings are never touched by the installer. They are kept across updates, and
+uninstalling asks before removing them.
+
+Updating an existing installation
+---------------------------------
+Installing a newer build over an existing one does NOT uninstall or delete the
+old version. The previous executable is moved to:
+
+    <install folder>\previous-versions\VerseLinkWindows-<version>.exe
+
+before the new one is copied in, so you can roll back by copying that file back
+over VerseLinkWindows.exe.
+
+If VerseLink is running, Setup closes it before updating and starts it again
+afterwards, so you are not left without your hotkey.
 
 Upgrading from a zip copy
 -------------------------
 If you previously ran VerseLink from an unzipped folder rather than an
-installer, that copy is invisible to this installer and will not be removed
-automatically - nothing recorded it as installed. Your settings are carried
-over on first run, but you should delete the old folder yourself, and remove
-its shortcut from your Startup folder if you added one, so you do not end up
+installer, that copy is invisible to this installer - nothing recorded it as
+installed, so it is not updated or removed. Your settings are carried over on
+first run, but you should delete the old folder yourself, and remove its
+shortcut from your Startup folder if you added one, so you do not end up
 running two copies.

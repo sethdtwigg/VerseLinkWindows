@@ -371,6 +371,28 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
 
+    switch (uMsg) {
+        // An outside request to shut down: the installer closing us before it
+        // replaces the exe, or Windows signing the user out. Restart Manager
+        // sends WM_QUERYENDSESSION then WM_ENDSESSION to top-level windows, so
+        // handling these is what lets an upgrade close VerseLink cleanly
+        // instead of failing on a locked exe.
+        //
+        // WM_CLOSE previously fell through to DefWindowProc, which destroyed
+        // the window but left the message loop and the worker thread running -
+        // the process stayed alive with no window and no tray icon.
+        case WM_QUERYENDSESSION:
+            return TRUE; // yes, we can shut down
+
+        case WM_CLOSE:
+        case WM_ENDSESSION:
+            LOG_INFO("Shutdown requested by the system or an installer");
+            g_shouldExit = true;
+            g_taskQueue.Shutdown();
+            PostQuitMessage(0);
+            return 0;
+    }
+
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 

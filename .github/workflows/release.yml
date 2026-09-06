@@ -101,18 +101,25 @@ jobs:
           $notes = @"
           ## Install
 
-          Download **VerseLink-$version-Setup.exe** and run it. It installs per-user, so there is no
-          administrator prompt, and installing over an existing copy upgrades it in place - the old
-          version is replaced and your settings are kept.
+          Download **VerseLink-$version-Setup.exe** and run it. You choose where it goes -
+          ``C:\VerseLink``, Program Files, anywhere. It defaults to a per-user location so there is
+          no administrator prompt; pick "all users" on the first dialog if you want a shared one.
 
-          Close VerseLink before upgrading if it is running; Setup will ask if you forget.
+          ## Updating an existing installation
+
+          Installing over an existing copy does **not** uninstall or delete it. The previous
+          executable is moved to ``<install folder>\previous-versions\VerseLinkWindows-<version>.exe``
+          before the new one is copied in, so rolling back is just copying that file back.
+
+          Your settings in ``%APPDATA%\VerseLink`` are never touched. If VerseLink is running, Setup
+          closes it before updating and starts it again afterwards.
 
           ## If you previously ran the zip
 
-          An unzipped copy is invisible to the installer and will not be removed automatically -
-          nothing recorded it as installed. Your settings are carried over on first run, but delete
-          the old folder yourself, and remove its Startup shortcut if you added one, so you do not
-          end up running two copies.
+          An unzipped copy is invisible to the installer - nothing recorded it as installed, so it is
+          neither updated nor removed. Your settings are carried over on first run, but delete the old
+          folder yourself, and remove its Startup shortcut if you added one, so you do not end up
+          running two copies.
 
           ## Files
 

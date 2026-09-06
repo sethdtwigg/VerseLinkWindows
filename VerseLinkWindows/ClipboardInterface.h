@@ -24,6 +24,7 @@ class ClipboardInterface
     std::string GetSelectedTextFromEditControl();
     std::string GetSelectedTextUsingClipboard();
     bool SendKeys(const std::vector<WORD>& keys);
+    void ReleaseHeldModifiers();
     std::string LogError(const std::string& message);
 
 public:

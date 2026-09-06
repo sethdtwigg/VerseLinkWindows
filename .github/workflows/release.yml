@@ -1,0 +1,137 @@
+name: Release
+
+# Pushing a v* tag publishes a release. workflow_dispatch runs the same pipeline
+# without publishing, so the packaging can be exercised end to end without
+# creating a release that then has to be deleted.
+on:
+  push:
+    tags: ["v*"]
+  # Packaging changes are built (never published) on their own pull requests, so
+  # a broken .iss or script is caught before it can break a real release. The
+  # publish step below is gated on a tag, so these runs only produce artifacts.
+  pull_request:
+    paths:
+      - "packaging/**"
+      - ".github/workflows/release.yml"
+      - "VerseLinkWindows/Version.h"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a GitHub Release (off: build and upload artifacts only)"
+        type: boolean
+        default: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # A tag must match Version.h, or the release would advertise a version the
+      # binary does not report. build-installer.ps1 enforces this too; doing it
+      # up front fails in seconds instead of after a full build.
+      - name: Determine and check version
+        id: version
+        shell: pwsh
+        run: |
+          $header = "VerseLinkWindows\Version.h"
+          $match = Select-String -Path $header -Pattern '#define\s+VERSELINK_VERSION_STRING\s+"([^"]+)"'
+          if (-not $match) { throw "VERSELINK_VERSION_STRING not found in $header" }
+          $version = $match.Matches[0].Groups[1].Value
+          Write-Host "Version.h says $version"
+
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tag = "${{ github.ref_name }}".TrimStart('v')
+            if ($tag -ne $version) {
+              throw "Tag ${{ github.ref_name }} does not match Version.h ($version). Bump Version.h, or tag the version that is actually in the tree."
+            }
+            Write-Host "Tag matches Version.h"
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Build application (Release x64)
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationPath
+          & "$vsRoot\MSBuild\Current\Bin\MSBuild.exe" "VerseLinkWindows\VerseLinkWindows.vcxproj" /p:Configuration=Release /p:Platform=x64 /m /v:m /nologo
+          exit $LASTEXITCODE
+
+      # Never package a build that cannot pass its own checks.
+      - name: Run headless self test
+        shell: cmd
+        run: |
+          VerseLinkWindows\x64\Release\VerseLinkWindows.exe --selftest
+          if errorlevel 1 exit /b 1
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $expect = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "" }
+          .\packaging\build-installer.ps1 -SkipBuild -ExpectVersion $expect
+
+      - name: Build portable zip
+        shell: pwsh
+        run: .\packaging\package.ps1 -SkipBuild -Platform x64
+
+      - name: Upload packages as artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: VerseLink-${{ steps.version.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag' || inputs.publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $tag = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "v$version" }
+
+          $notes = @"
+          ## Install
+
+          Download **VerseLink-$version-Setup.exe** and run it. You choose where it goes -
+          ``C:\VerseLink``, Program Files, anywhere. It defaults to a per-user location so there is
+          no administrator prompt; pick "all users" on the first dialog if you want a shared one.
+
+          ## Updating an existing installation
+
+          Installing over an existing copy does **not** uninstall or delete it. The previous
+          executable is moved to ``<install folder>\previous-versions\VerseLinkWindows-<version>.exe``
+          before the new one is copied in, so rolling back is just copying that file back.
+
+          Your settings in ``%APPDATA%\VerseLink`` are never touched. If VerseLink is running, Setup
+          closes it before updating and starts it again afterwards.
+
+          ## If you previously ran the zip
+
+          An unzipped copy is invisible to the installer - nothing recorded it as installed, so it is
+          neither updated nor removed. Your settings are carried over on first run, but delete the old
+          folder yourself, and remove its Startup shortcut if you added one, so you do not end up
+          running two copies.
+
+          ## Files
+
+          | File | What it is |
+          |---|---|
+          | ``VerseLink-$version-Setup.exe`` | Installer (recommended) |
+          | ``VerseLink-$version-x64-portable.zip`` | Portable copy, no installer |
+
+          Settings and log live in ``%APPDATA%\VerseLink``. Only the King James Version is bundled;
+          other translations are copyrighted and must be supplied by you.
+          "@
+
+          gh release create $tag (Get-ChildItem dist\* | ForEach-Object { $_.FullName }) `
+            --title "VerseLink $version" `
+            --notes $notes

@@ -56,8 +56,14 @@ if (-not $SkipBuild -and (Get-Item $exePath).LastWriteTime -lt $buildStart) {
 
 Write-Host "== Packaging $exePath ==" -ForegroundColor Cyan
 
-$stamp = Get-Date -Format "yyyyMMdd"
-$distName = "VerseLinkWindows-$stamp-$Platform"
+# Named by version rather than by date so a zip pairs unambiguously with the
+# installer and the release it belongs to.
+$versionHeader = Join-Path $projDir "Version.h"
+$match = Select-String -Path $versionHeader -Pattern '#define\s+VERSELINK_VERSION_STRING\s+"([^"]+)"'
+if (-not $match) { throw "VERSELINK_VERSION_STRING not found in $versionHeader" }
+$version = $match.Matches[0].Groups[1].Value
+
+$distName = "VerseLink-$version-$Platform-portable"
 $stage = Join-Path $PSScriptRoot "$distName"
 $zip = Join-Path $repoRoot "dist\$distName.zip"
 
@@ -65,22 +71,15 @@ if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory -Path $stage\Bibles -Force | Out-Null
 
 Copy-Item $exePath $stage
-Copy-Item (Join-Path $repoRoot "config.json") $stage
 Copy-Item (Join-Path $projDir "VerseLinkIcon.ico") $stage -ErrorAction SilentlyContinue
 Copy-Item (Join-Path $repoRoot "README.md") $stage
 Copy-Item (Join-Path $repoRoot "Bibles\KJV.xml") $stage\Bibles
+Copy-Item (Join-Path $PSScriptRoot "DISTRIBUTION-NOTES.txt") $stage
 
-@'
-VerseLink Windows - distribution notes
-======================================
-
-This package includes the King James Version (public domain).
-
-Other translations such as the NASB or ESV are copyrighted. To use them,
-obtain the text legally and place the XML file(s) into the Bibles folder
-next to VerseLinkWindows.exe, then pick the version in the tray icon's
-Settings dialog.
-'@ | Set-Content (Join-Path $stage "DISTRIBUTION-NOTES.txt")
+# config.json is deliberately not shipped. Settings live in
+# %APPDATA%\VerseLink\config.json and are created with defaults on first run;
+# a config.json next to the exe would be picked up by the legacy-config
+# migration and could overwrite what an upgrading user actually had.
 
 New-Item -ItemType Directory -Path (Split-Path $zip) -Force | Out-Null
 if (Test-Path $zip) { Remove-Item $zip -Force }
